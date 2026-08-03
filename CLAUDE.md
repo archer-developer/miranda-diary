@@ -1,0 +1,136 @@
+# miranda-diary — project notes for Claude Code
+
+A personal diary MCP server: stores notes, thoughts, and events in SQLite
+with Gemini vector embeddings for semantic search. Sibling project to
+[miranda-code-execution-sandbox](../miranda-code-execution-sandbox) —
+same stack, same conventions.
+
+## Conventions
+
+Same as miranda-code-execution-sandbox: write explanatory comments (doc-comments
+on exported symbols, comments on non-obvious logic). The terse/no-comments default
+doesn't apply here — a small home-infra codebase maintained intermittently benefits
+more from comments that carry forward *why* a decision was made. Config follows the
+same `Default()`-in-Go + YAML-overrides-only pattern.
+
+## Architecture
+
+```
+Miranda <--Streamable HTTP (bearer token)--> httpserver
+                                                  |
+                                             mcpserver
+                                           /     |     \
+                              add_record  /  search \  remove
+                                         |           |
+                                     diary.Store (SQLite)
+                                         |
+                                   embedding.Embedder
+                                         |
+                                  Gemini HTTP API
+                                (text-embedding-004)
+```
+
+**The binary runs host-native** — no Docker, no CGO. `CGO_ENABLED=0`,
+static binary, deployed and run the same way as miranda-code-execution-sandbox.
+`modernc.org/sqlite` is used instead of `mattn/go-sqlite3` precisely because
+it's a pure-Go SQLite port that doesn't need CGO.
+
+### Request flow for `diary_search`
+
+1. `internal/httpserver.requireBearerToken` checks `Authorization: Bearer`
+   against `auth_token_env`'s value — same constant-time comparison as sandbox.
+2. `mcpserver` validates `user_id` and `query` are non-empty, clamps `limit`.
+3. `embedding.GeminiEmbedder.Embed` calls the Gemini API to get a 768-dim
+   float32 vector for the query text.
+4. `diary.Store.Search` runs `SELECT ... FROM records WHERE user_id = ?`,
+   loads all of that user's embeddings into memory, and ranks them by cosine
+   similarity computed in Go.
+5. Top `limit` results are returned sorted descending by score.
+
+`diary_add_record` is the same but writes: embed → INSERT.
+`diary_remove` is `DELETE FROM records WHERE id = ? AND user_id = ?`.
+
+### User isolation
+
+Every record has a `user_id TEXT NOT NULL` column. All three tool handlers
+receive `user_id` as an explicit parameter from the MCP caller (Miranda), and
+every SQL query filters by it. `diary_remove` uses `AND user_id = ?` so a
+caller can't delete another user's record even with a known ID — it just gets
+`deleted: false`, indistinguishable from a missing record.
+
+**Why user_id in the tool call, not derived from the token:** There's a single
+shared bearer token (Miranda is the only caller). Miranda knows from conversation
+context who it's talking to and passes `user_id` explicitly. This is simpler than
+per-user tokens and sets up the right structure for the planned future addition of
+per-user biometric encryption — at that point `user_id` → decryption key, and the
+tool call already carries it.
+
+### Embedding storage
+
+Embeddings are stored as raw binary BLOBs in SQLite:
+`encodeEmbedding` / `decodeEmbedding` in `internal/diary/store.go` pack
+float32 values as little-endian 4-byte units. This is cheaper than JSON and
+avoids any parsing overhead at search time.
+
+Cosine similarity is computed in pure Go over all of a user's embeddings
+loaded into memory. For a personal diary even at tens of thousands of entries
+this is fast enough (10 000 records × 768 dims × 4 bytes ≈ 30 MB RAM,
+similarity computation is a tight float multiply-accumulate loop). Don't
+add a vector database unless profiling shows this is actually the bottleneck.
+
+**Important:** if you switch the embedding model, the new model's embedding
+space is incompatible with existing stored embeddings — similarity scores
+become meaningless. There's no migration path built in yet; changing
+`embedding.model` in config on a non-empty database requires re-embedding
+all records manually (or wiping and re-adding).
+
+### Gemini embedding model
+
+`text-embedding-004` — 768 dimensions, free tier (1 500 req/day), very good
+multilingual quality. The client is created once at startup in
+`embedding.NewGemini` and reused across calls (the `genai.Client` is safe for
+concurrent use). A nil API key is caught at startup, not at first call.
+
+## Testing
+
+```bash
+make test        # go test ./... -race
+```
+
+`internal/diary/store_test.go` uses an in-memory SQLite database (`:memory:`)
+so tests are fast and require no filesystem setup. Embedding tests would
+require a real Gemini API key — there are none currently; the `Embedder`
+interface exists to make the mcpserver testable with a fake embedder if needed.
+
+`TestStore_UserIsolation` is the critical test: it verifies that one user
+cannot see or delete another user's records, and that `Remove` with a
+wrong `user_id` returns `deleted: false` without error.
+
+## Deploying
+
+`scripts/deploy.sh` cross-compiles for `linux/amd64` and deploys to
+`archer@192.168.1.50` as a `systemd --user` service on port `:8789`.
+`config/config.yaml` and `.env` are **never touched by deploy** — they
+live on the server and hold secrets. On first deploy, create
+`~/miranda-diary/.env` manually:
+
+```
+DIARY_MCP_TOKEN=<openssl rand -hex 32>
+GEMINI_API_KEY=<from Google AI Studio>
+```
+
+The service refuses to start if either is unset. Check `journalctl --user -u miranda-diary`
+if the service doesn't come up — the error message names the missing variable.
+
+## What's deliberately not here
+
+- **Per-user tokens** — a single shared token is enough; Miranda is the only
+  caller and user identity comes from the tool parameter, not the token.
+- **Vector database (Qdrant, etc.)** — in-memory cosine similarity over SQLite
+  BLOBs is sufficient for personal-diary scale and eliminates an external
+  service dependency.
+- **Ollama / local embedding** — Gemini free tier is simpler to operate than
+  a local model; no GPU or extra process required.
+- **Encryption at rest** — planned as a follow-up feature using per-user
+  biometric keys. The `user_id` parameter is already in every tool call to
+  support this; the schema and query structure don't need to change.
