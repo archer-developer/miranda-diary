@@ -27,7 +27,7 @@ Miranda <--Streamable HTTP (bearer token)--> httpserver
                                    embedding.Embedder
                                          |
                                   Gemini HTTP API
-                                (text-embedding-004)
+                                (gemini-embedding-2)
 ```
 
 **The binary runs host-native** — no Docker, no CGO. `CGO_ENABLED=0`,
@@ -86,7 +86,7 @@ all records manually (or wiping and re-adding).
 
 ### Gemini embedding model
 
-`text-embedding-004` — 768 dimensions, free tier (1 500 req/day), very good
+`gemini-embedding-2` - very good
 multilingual quality. The client is created once at startup in
 `embedding.NewGemini` and reused across calls (the `genai.Client` is safe for
 concurrent use). A nil API key is caught at startup, not at first call.

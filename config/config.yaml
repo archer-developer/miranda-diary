@@ -10,7 +10,7 @@
 
 # embedding:
 #   api_key_env: "GEMINI_API_KEY"
-#   model: "text-embedding-004"   # 768 dims, free tier, 1500 req/day
+#   model: "gemini-embedding-2"
 
 # search:
 #   default_limit: 10

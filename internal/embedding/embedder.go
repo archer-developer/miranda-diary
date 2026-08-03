@@ -9,7 +9,7 @@ import "context"
 // comparison.
 type Embedder interface {
 	// Embed returns the embedding for text. The returned slice length is
-	// determined by the underlying model (768 for text-embedding-004) and is
+	// determined by the underlying model (gemini-embedding-2) and is
 	// consistent across calls with the same model.
 	Embed(ctx context.Context, text string) ([]float32, error)
 }

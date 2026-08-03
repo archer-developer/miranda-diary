@@ -36,9 +36,9 @@ type EmbeddingConfig struct {
 	// (Gemini) API key. The key itself is never read here — only the env var
 	// name is stored in config so it can be audited without touching secrets.
 	APIKeyEnv string `yaml:"api_key_env"`
-	// Model is the Gemini embedding model identifier. text-embedding-004 is
-	// the current recommended free-tier model: 768 dimensions, very good
-	// multilingual quality, generous rate limits (1 500 req/day free).
+	// Model is the Gemini embedding model identifier. gemini-embedding-2 is
+	// the current recommended free-tier model: very good
+	// multilingual quality.
 	Model string `yaml:"model"`
 }
 
@@ -67,7 +67,7 @@ func Default() Config {
 		},
 		Embedding: EmbeddingConfig{
 			APIKeyEnv: "GEMINI_API_KEY",
-			Model:     "text-embedding-004",
+			Model:     "gemini-embedding-2",
 		},
 		Search: SearchConfig{
 			DefaultLimit: 10,

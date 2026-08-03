@@ -2,14 +2,14 @@
 
 An MCP server that gives Miranda three tools for a personal diary:
 `diary_add_record`, `diary_search`, `diary_remove`. Notes and thoughts are
-stored in SQLite alongside semantic embeddings (Gemini `text-embedding-004`)
+stored in SQLite alongside semantic embeddings (Gemini `gemini-embedding-2`)
 so they can be retrieved by meaning, not just keywords. It's a standalone Go
 service — a sibling to [Miranda](../miranda) and
 [miranda-code-execution-sandbox](../miranda-code-execution-sandbox) — meant to
 be wired into Miranda as one more tool source.
 
 ```
-Miranda <--Streamable HTTP--> miranda-diary <--Gemini API--> text-embedding-004
+Miranda <--Streamable HTTP--> miranda-diary <--Gemini API--> gemini-embedding-2
                                     |
                               SQLite (diary.db)
                           user_id + content + embedding
@@ -95,7 +95,7 @@ database:
 
 embedding:
   api_key_env: "GEMINI_API_KEY"
-  model: "text-embedding-004"  # 768 dims, free tier (1 500 req/day)
+  model: "gemini-embedding-2"
 
 search:
   default_limit: 10
@@ -111,8 +111,7 @@ start if either is unset or empty.
 
 ### Gemini free tier
 
-`text-embedding-004` is available on Google AI's free plan: 1 500 embedding
-requests per day, no cost. For a personal diary that's effectively unlimited.
+`gemini-embedding-2` is available on Google AI's free plan, no cost. For a personal diary that's effectively unlimited.
 Get an API key at <https://aistudio.google.com/apikey>.
 
 ### Debug logging
