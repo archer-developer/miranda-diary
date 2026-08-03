@@ -1,0 +1,5 @@
+.env
+miranda-diary
+dist/
+data/
+logs/

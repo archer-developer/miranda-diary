@@ -1,0 +1,20 @@
+# miranda-diary configuration.
+# All fields are optional — missing fields use built-in defaults.
+# Secrets come from environment variables, never from here.
+
+# http_addr: ":8789"
+# auth_token_env: "DIARY_MCP_TOKEN"
+
+# database:
+#   path: "data/diary.db"
+
+# embedding:
+#   api_key_env: "GEMINI_API_KEY"
+#   model: "text-embedding-004"   # 768 dims, free tier, 1500 req/day
+
+# search:
+#   default_limit: 10
+#   max_limit: 50
+
+logging:
+  level: "info"
