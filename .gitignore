@@ -1,5 +1,5 @@
 .env
-miranda-diary
+/miranda-diary
 dist/
 data/
 logs/

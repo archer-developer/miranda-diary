@@ -136,8 +136,8 @@ mcp:
 ```
 
 and set `DIARY_MCP_TOKEN` in Miranda's `.env` to the same value configured
-here. Miranda will then expose the tools as `diary_diary_add_record`,
-`diary_diary_search`, and `diary_diary_remove`.
+here. Miranda will then expose the tools as `diary_add_record`,
+`diary_search`, and `diary_remove`.
 
 ## MCP tools
 

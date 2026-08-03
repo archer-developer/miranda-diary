@@ -43,8 +43,12 @@ func New(path string) (*Store, error) {
 		return nil, fmt.Errorf("diary: open %s: %w", path, err)
 	}
 
-	// Single writer is fine for a personal tool; WAL mode improves read
-	// concurrency without sacrificing durability.
+	// Single writer: cap the pool to one connection so concurrent writes queue
+	// inside database/sql rather than hitting SQLite's busy_timeout=0 default
+	// and returning SQLITE_BUSY immediately.
+	db.SetMaxOpenConns(1)
+
+	// WAL mode improves read concurrency without sacrificing durability.
 	if _, err := db.Exec("PRAGMA journal_mode=WAL"); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("diary: enable WAL: %w", err)

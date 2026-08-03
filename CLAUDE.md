@@ -35,7 +35,7 @@ static binary, deployed and run the same way as miranda-code-execution-sandbox.
 `modernc.org/sqlite` is used instead of `mattn/go-sqlite3` precisely because
 it's a pure-Go SQLite port that doesn't need CGO.
 
-### Request flow for `diary_search`
+### Request flow for `diary_search` (exposed as `search`)
 
 1. `internal/httpserver.requireBearerToken` checks `Authorization: Bearer`
    against `auth_token_env`'s value — same constant-time comparison as sandbox.
@@ -47,14 +47,14 @@ it's a pure-Go SQLite port that doesn't need CGO.
    similarity computed in Go.
 5. Top `limit` results are returned sorted descending by score.
 
-`diary_add_record` is the same but writes: embed → INSERT.
-`diary_remove` is `DELETE FROM records WHERE id = ? AND user_id = ?`.
+`add_record` is the same but writes: embed → INSERT.
+`remove` is `DELETE FROM records WHERE id = ? AND user_id = ?`.
 
 ### User isolation
 
 Every record has a `user_id TEXT NOT NULL` column. All three tool handlers
 receive `user_id` as an explicit parameter from the MCP caller (Miranda), and
-every SQL query filters by it. `diary_remove` uses `AND user_id = ?` so a
+every SQL query filters by it. `remove` uses `AND user_id = ?` so a
 caller can't delete another user's record even with a known ID — it just gets
 `deleted: false`, indistinguishable from a missing record.
 

@@ -19,9 +19,13 @@ type GeminiEmbedder struct {
 // NewGemini creates a GeminiEmbedder. apiKey is the Google AI API key;
 // model is the embedding model name (e.g. "text-embedding-004").
 func NewGemini(ctx context.Context, apiKey, model string) (*GeminiEmbedder, error) {
+	// The SDK defaults to v1beta; text-embedding-004 requires the stable v1 API.
 	client, err := genai.NewClient(ctx, &genai.ClientConfig{
 		APIKey:  apiKey,
 		Backend: genai.BackendGeminiAPI,
+		HTTPOptions: genai.HTTPOptions{
+			APIVersion: "v1",
+		},
 	})
 	if err != nil {
 		return nil, fmt.Errorf("embedding: create gemini client: %w", err)
@@ -37,7 +41,7 @@ func (g *GeminiEmbedder) Embed(ctx context.Context, text string) ([]float32, err
 	if err != nil {
 		return nil, fmt.Errorf("embedding: gemini embed: %w", err)
 	}
-	if len(result.Embeddings) == 0 {
+	if len(result.Embeddings) == 0 || len(result.Embeddings[0].Values) == 0 {
 		return nil, fmt.Errorf("embedding: gemini returned no embeddings")
 	}
 	return result.Embeddings[0].Values, nil
