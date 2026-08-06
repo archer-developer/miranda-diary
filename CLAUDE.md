@@ -151,7 +151,7 @@ wrong `user_id` returns `deleted: false` without error.
 ## Deploying
 
 `scripts/deploy.sh` cross-compiles for `linux/amd64` and deploys to
-`archer@192.168.1.50` as a `systemd --user` service on port `:8789`.
+`archer@miranda` as a `systemd --user` service on port `:8789`.
 `config/*.yaml` (everything except the tracked `config.yaml.dist` template)
 and `.env` are **never touched by deploy** — they live on the server and
 hold secrets or deployment-specific details. On first deploy, create

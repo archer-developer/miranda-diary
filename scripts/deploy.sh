@@ -5,7 +5,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-remote_host="archer@192.168.1.50"
+remote_host="archer@miranda"
 remote_dir="miranda-diary"
 service_name="miranda-diary"
 build_out="dist/miranda-diary-linux-amd64"

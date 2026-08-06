@@ -77,7 +77,7 @@ details that shouldn't be in the deploy flow.
 On first deploy, create `~/miranda-diary/.env` on the server manually:
 
 ```bash
-ssh archer@192.168.1.50 'mkdir -p ~/miranda-diary'
+ssh archer@miranda 'mkdir -p ~/miranda-diary'
 # then create ~/miranda-diary/.env with DIARY_MCP_TOKEN and GEMINI_API_KEY
 ```
 
@@ -148,7 +148,7 @@ Add an entry to Miranda's `config/mcp.yaml`:
 mcp:
   servers:
     - name: diary
-      url: "http://192.168.1.50:8789/mcp"
+      url: "http://miranda:8789/mcp"
       token_env: "DIARY_MCP_TOKEN"
       enabled: true
 ```
