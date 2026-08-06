@@ -69,9 +69,10 @@ make check         # fmt + lint + test — run this before committing
 ```
 
 Cross-compiles for `linux/amd64`, ships the binary over SSH, and restarts
-the `systemd --user` service. `config/config.yaml` and `.env` are **never
-uploaded** — they're managed on the server separately and hold secrets that
-shouldn't be in the deploy flow.
+the `systemd --user` service. `config/*.yaml` (everything except the
+tracked `config.yaml.dist` template) and `.env` are **never uploaded** —
+they're managed on the server separately and hold secrets or deployment
+details that shouldn't be in the deploy flow.
 
 On first deploy, create `~/miranda-diary/.env` on the server manually:
 
@@ -82,9 +83,17 @@ ssh archer@192.168.1.50 'mkdir -p ~/miranda-diary'
 
 ## Configuration
 
-Every field has a built-in default (see `internal/config.Default()`), so
-`config/config.yaml` only needs to override what differs. The file shipped
-in this repo has all fields commented out — the defaults run the service as-is.
+Every field has a built-in default (see `internal/config.Default()`).
+`config/config.yaml.dist` is the checked-into-git template documenting every
+available field and its default — it is never loaded by the running
+service. To configure a real deployment, copy it to `config/config.yaml`
+(or split it into several `config/*.yaml` files) and edit only what needs
+to differ; every `config/*.yaml` file except `config.yaml.dist` itself is
+gitignored, since real config is environment-specific. On startup, `main.go`
+lists every `config/*.yaml` file (alphabetically) and merges them over the
+built-in defaults in order — later files override earlier ones
+field-by-field. Point the service at a different directory with
+`DIARY_CONFIG_DIR`.
 
 ```yaml
 http_addr: ":8789"
@@ -101,13 +110,23 @@ search:
   default_limit: 10
   max_limit: 50
 
+users:
+  - id: "alice"
+  - id: "bob"
+
 logging:
   level: "info"
 ```
 
-Auth tokens and API keys are never stored in `config.yaml` — only the
-**name** of the environment variable to read them from. The server refuses to
-start if either is unset or empty.
+`users` is the closed list of household members every tool call's `user_id`
+is checked against — it has no built-in default and the service refuses to
+start without it (see User isolation below). It's a list of objects, not
+bare strings, so future per-user settings can be added without another
+breaking config change.
+
+Auth tokens and API keys are never stored in config — only the **name** of
+the environment variable to read them from. The server refuses to start if
+either is unset or empty.
 
 ### Gemini free tier
 

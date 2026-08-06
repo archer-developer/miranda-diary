@@ -23,15 +23,20 @@ const (
 )
 
 // New builds and returns the MCP server with all three diary tools registered.
-// knownUsers is the closed set of valid user_id values (config.Config.KnownUsers)
-// — every handler rejects a call whose user_id isn't in this set, see
-// resolveUser. A nil logger falls back to slog.Default().
-func New(store *diary.Store, embedder embedding.Embedder, cfg config.SearchConfig, knownUsers []string, logger *slog.Logger) *mcp.Server {
+// configuredUsers is the closed set of allowed household members
+// (config.Config.Users) — every handler rejects a call whose user_id isn't
+// one of their IDs, see resolveUser. A nil logger falls back to
+// slog.Default().
+func New(store *diary.Store, embedder embedding.Embedder, cfg config.SearchConfig, configuredUsers []config.UserConfig, logger *slog.Logger) *mcp.Server {
 	if logger == nil {
 		logger = slog.Default()
 	}
 
-	users := slices.Sorted(slices.Values(knownUsers))
+	userIDs := make([]string, len(configuredUsers))
+	for i, u := range configuredUsers {
+		userIDs[i] = u.ID
+	}
+	users := slices.Sorted(slices.Values(userIDs))
 	userHint := fmt.Sprintf(" user_id must be one of the configured users: %s.", strings.Join(users, ", "))
 
 	server := mcp.NewServer(&mcp.Implementation{Name: serverName, Version: serverVersion}, nil)
@@ -68,7 +73,7 @@ func New(store *diary.Store, embedder embedding.Embedder, cfg config.SearchConfi
 // resolveUser trims userID and checks it against users (the sorted list
 // New() already computed once). An empty or unrecognized user_id is a
 // caller error, not something worth guessing a default for — see
-// config.Config.KnownUsers for why this can't just accept anything.
+// config.Config.Users for why this can't just accept anything.
 func resolveUser(users []string, action, userID string) (string, error) {
 	userID = strings.TrimSpace(userID)
 	if userID == "" {

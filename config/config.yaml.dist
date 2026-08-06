@@ -1,0 +1,44 @@
+# miranda-diary configuration template.
+#
+# This .dist file documents every available field with its built-in default
+# (see internal/config.Default()) and is checked into git; it is never
+# loaded directly. To configure a real deployment, copy it to
+# config/config.yaml (or split it into several config/*.yaml files) and edit
+# only what needs to differ — every config/*.yaml file is gitignored except
+# this one. Full merge semantics (which files get loaded, in what order, how
+# they combine): see internal/config's package doc comment and
+# cmd/miranda-diary/main.go's configFilePaths.
+#
+# Secrets themselves never go in a config file, this one included — only the
+# *name* of an environment variable to read them from at startup (fields
+# ending in _env). See .env.example.
+
+# http_addr: ":8789"
+# auth_token_env: "DIARY_MCP_TOKEN"
+
+# database:
+#   path: "data/diary.db"
+
+# embedding:
+#   api_key_env: "GEMINI_API_KEY"
+#   model: "gemini-embedding-2"
+
+# search:
+#   default_limit: 10
+#   max_limit: 50
+
+# users has no built-in default and MUST be set: the closed list of
+# household members every tool call's user_id is checked against (Miranda's
+# own userID for each household member — see config.Config.Users). Left
+# unset, the service refuses to start rather than run with no allowlist at
+# all. It's a list of objects, not bare strings, so future per-user settings
+# (e.g. a per-user encryption key reference) can be added without another
+# breaking config change. This repo's own template intentionally does not
+# hardcode real household member ids — set the real list only in the
+# server's own config.yaml (not touched by deploy, see CLAUDE.md), e.g.:
+# users:
+#   - id: "alice"
+#   - id: "bob"
+
+logging:
+  level: "info"

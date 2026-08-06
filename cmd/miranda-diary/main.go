@@ -9,8 +9,15 @@
 // already has it. Future versions will add per-user encryption keyed by
 // biometric credentials.
 //
-// Architecture mirrors miranda-code-execution-sandbox: static CGO-free binary,
-// config.yaml + .env for local development, systemd --user service on the server.
+// Architecture mirrors miranda-service-skeleton and miranda-code-execution-sandbox:
+// static CGO-free binary, config/*.yaml + .env for local development,
+// systemd --user service on the server.
+//
+// Bootstrap: envfile.Load(.env) -> list config/*.yaml (configFilePaths) ->
+// config.Load(paths...) -> build the real logger -> check required secrets
+// are set -> build the MCP server -> wrap it in a Streamable HTTP handler ->
+// mount it behind bearer auth and /healthz -> serve until SIGINT/SIGTERM,
+// then shut down gracefully.
 package main
 
 import (
@@ -22,6 +29,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -36,11 +44,14 @@ import (
 )
 
 const (
-	dotEnvPath        = ".env"
-	defaultConfigPath = "config/config.yaml"
-	shutdownTimeout   = 10 * time.Second
-	debugLogDir       = "logs"
-	debugLogFile      = "debug.log"
+	dotEnvPath       = ".env"
+	defaultConfigDir = "config"
+	// configDirEnv overrides defaultConfigDir — e.g. for a deployment layout
+	// that keeps config elsewhere.
+	configDirEnv    = "DIARY_CONFIG_DIR"
+	shutdownTimeout = 10 * time.Second
+	debugLogDir     = "logs"
+	debugLogFile    = "debug.log"
 )
 
 func main() {
@@ -50,12 +61,18 @@ func main() {
 		logger.Warn("failed to load .env, continuing with process environment", "error", err)
 	}
 
-	cfgPath := defaultConfigPath
-	if v := os.Getenv("DIARY_CONFIG"); v != "" {
-		cfgPath = v
+	cfgDir := defaultConfigDir
+	if v := os.Getenv(configDirEnv); v != "" {
+		cfgDir = v
 	}
 
-	cfg, err := config.Load(cfgPath)
+	configPaths, err := configFilePaths(cfgDir, logger)
+	if err != nil {
+		logger.Error("fatal", "error", err)
+		os.Exit(1)
+	}
+
+	cfg, err := config.Load(configPaths...)
 	if err != nil {
 		logger.Error("fatal", "error", err)
 		os.Exit(1)
@@ -73,6 +90,48 @@ func main() {
 		logger.Error("fatal", "error", err)
 		os.Exit(1)
 	}
+}
+
+// configFilePaths lists the real config override files the service should
+// load: every regular file directly under cfgDir whose name ends in
+// ".yaml", sorted by name (os.ReadDir guarantees this) so config.Load's
+// merge order — later file wins per field — is deterministic. This
+// deliberately excludes config.yaml.dist, since it doesn't end in plain
+// ".yaml"; see internal/config's doc comment for the full merge semantics.
+//
+// os.ReadDir is used instead of filepath.Glob deliberately: Glob treats
+// cfgDir as pattern syntax (so a directory literally named e.g.
+// "configs[2024]" silently matches nothing instead of being read as a
+// literal path) and reports "no matches, no error" for a directory that
+// doesn't exist *or* one that exists but can't be read (e.g. a permissions
+// mistake) — indistinguishable from "no config files, use defaults" even
+// though the latter is a real misconfiguration that should be loud.
+// os.ReadDir never interprets cfgDir as a pattern and returns a real error
+// for the unreadable case. A missing cfgDir is not treated as an error here
+// either — it's the same as an empty one, i.e. "no overrides" — but is
+// logged so a typo'd DIARY_CONFIG_DIR is at least visible in the log rather
+// than silently producing an all-defaults service (which, since users has
+// no default, fails startup anyway — see config.Load).
+func configFilePaths(cfgDir string, logger *slog.Logger) ([]string, error) {
+	entries, err := os.ReadDir(cfgDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			logger.Warn("config directory not found, using built-in defaults", "dir", cfgDir)
+			return nil, nil
+		}
+		return nil, fmt.Errorf("main: read config dir %s: %w", cfgDir, err)
+	}
+
+	var paths []string
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".yaml") {
+			continue
+		}
+		paths = append(paths, filepath.Join(cfgDir, entry.Name()))
+	}
+
+	logger.Info("config files discovered", "dir", cfgDir, "paths", paths)
+	return paths, nil
 }
 
 func run(cfg config.Config, logger *slog.Logger) error {
@@ -107,7 +166,7 @@ func run(cfg config.Config, logger *slog.Logger) error {
 		return fmt.Errorf("main: init gemini embedder: %w", err)
 	}
 
-	server := mcpserver.New(store, embedder, cfg.Search, cfg.KnownUsers, logger)
+	server := mcpserver.New(store, embedder, cfg.Search, cfg.Users, logger)
 	mcpHandler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return server }, nil)
 	handler := httpserver.New(mcpHandler, token)
 	httpServer := &http.Server{Addr: cfg.HTTPAddr, Handler: handler}

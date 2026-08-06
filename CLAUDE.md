@@ -10,8 +10,9 @@ same stack, same conventions.
 Same as miranda-code-execution-sandbox: write explanatory comments (doc-comments
 on exported symbols, comments on non-obvious logic). The terse/no-comments default
 doesn't apply here — a small home-infra codebase maintained intermittently benefits
-more from comments that carry forward *why* a decision was made. Config follows the
-same `Default()`-in-Go + YAML-overrides-only pattern.
+more from comments that carry forward *why* a decision was made. Config follows
+the same `Default()`-in-Go + YAML-overrides pattern as
+[miranda-service-skeleton](../miranda-service-skeleton) — see Configuration below.
 
 ## Architecture
 
@@ -34,6 +35,24 @@ Miranda <--Streamable HTTP (bearer token)--> httpserver
 static binary, deployed and run the same way as miranda-code-execution-sandbox.
 `modernc.org/sqlite` is used instead of `mattn/go-sqlite3` precisely because
 it's a pure-Go SQLite port that doesn't need CGO.
+
+### Configuration
+
+Follows [miranda-service-skeleton](../miranda-service-skeleton)'s pattern
+exactly: `internal/config.Default()` populates every field, and
+`config/config.yaml.dist` is the single, checked-into-git source of truth
+documenting every available field and its default — it is never loaded by
+the running service. A real deployment provides any number of real
+`config/*.yaml` files (a single `config.yaml`, or split by topic), each
+gitignored (only `config.yaml.dist` is tracked). `main.go`'s
+`configFilePaths` lists them (`os.ReadDir` over `config/` or the directory
+named by `DIARY_CONFIG_DIR`, not `filepath.Glob` — see that function's own
+comment for why) and passes the resulting paths, in that order, to
+`config.Load(paths...)`, which starts from `Default()` and unmarshals each
+file on top of it in turn — later files override earlier ones
+field-by-field. A missing file or missing config directory is not an error;
+`validate()` at the end of `Load()` is what rejects a config that's missing
+something required (like `users` — see User isolation below).
 
 ### Request flow for `diary_search` (exposed as `search`)
 
@@ -65,9 +84,9 @@ per-user tokens and sets up the right structure for the planned future addition 
 per-user biometric encryption — at that point `user_id` → decryption key, and the
 tool call already carries it.
 
-**`user_id` is validated against `config.KnownUsers`, not free text.** Every
-tool handler runs `mcpserver.resolveUser` before touching the store — an
-empty or unrecognized `user_id` is a hard error, not a value the store
+**`user_id` is validated against `config.Config.Users`, not free text.**
+Every tool handler runs `mcpserver.resolveUser` before touching the store —
+an empty or unrecognized `user_id` is a hard error, not a value the store
 silently accepts. This was added after a real incident: Miranda's system
 prompt used to only tell the LLM the current speaker's *display name*, not
 the technical id it must pass as `user_id`; for one household member the two
@@ -78,11 +97,15 @@ two-layered: Miranda's own prompt now spells out the id explicitly (see
 Miranda's `internal/httpapi/agent_loop.go`), and this validation exists so
 that *if* a caller ever gets it wrong again anyway — a typo, a stale prompt,
 a different future caller — it fails loudly instead of silently starting a
-new, unsearchable `user_id` bucket. `known_users` has no built-in default
-(see `config.Default`) specifically so a deployment can't accidentally run
-with no allowlist at all; it must be set explicitly in the server's own
-`config.yaml` (never committed with real household member names — see that
-file's own template comment).
+new, unsearchable `user_id` bucket. `users` has no built-in default (see
+`config.Default`) specifically so a deployment can't accidentally run with
+no allowlist at all; it must be set explicitly in the server's own
+`config.yaml` (never committed with real household member ids — see
+`config/config.yaml.dist`'s own template comment). `Users` is
+`[]config.UserConfig` (a `yaml:"id"` struct field) rather than a bare
+`[]string` specifically so per-user settings — the planned per-user
+biometric encryption key reference, for one — can be added as new struct
+fields later without another breaking rename of the config key.
 
 ### Embedding storage
 
@@ -129,8 +152,9 @@ wrong `user_id` returns `deleted: false` without error.
 
 `scripts/deploy.sh` cross-compiles for `linux/amd64` and deploys to
 `archer@192.168.1.50` as a `systemd --user` service on port `:8789`.
-`config/config.yaml` and `.env` are **never touched by deploy** — they
-live on the server and hold secrets. On first deploy, create
+`config/*.yaml` (everything except the tracked `config.yaml.dist` template)
+and `.env` are **never touched by deploy** — they live on the server and
+hold secrets or deployment-specific details. On first deploy, create
 `~/miranda-diary/.env` manually:
 
 ```

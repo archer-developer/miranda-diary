@@ -34,7 +34,7 @@ var testUsers = []string{"archer", "anna"}
 
 // TestMCPServer_UnknownUserRejected is the regression test for the bug this
 // validation exists to catch: every tool call carries user_id as a plain
-// model-supplied string (see config.Config.KnownUsers), so a caller passing
+// model-supplied string (see config.Config.Users), so a caller passing
 // a wrong-but-plausible value (a display name, a typo, another user's id
 // picked up from context) must fail loudly instead of silently writing to
 // or reading from an unintended bucket.
