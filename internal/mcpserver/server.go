@@ -4,6 +4,7 @@ package mcpserver
 
 import (
 	"context"
+	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"slices"
@@ -15,6 +16,7 @@ import (
 	"github.com/archer-developer/miranda-diary/internal/config"
 	"github.com/archer-developer/miranda-diary/internal/diary"
 	"github.com/archer-developer/miranda-diary/internal/embedding"
+	"github.com/archer-developer/miranda-diary/internal/secret"
 )
 
 const (
@@ -39,6 +41,13 @@ func New(store *diary.Store, embedder embedding.Embedder, cfg config.SearchConfi
 	users := slices.Sorted(slices.Values(userIDs))
 	userHint := fmt.Sprintf(" user_id must be one of the configured users: %s.", strings.Join(users, ", "))
 
+	// userMap provides O(1) lookup of per-user settings (e.g. Encryption) inside
+	// handlers without re-scanning the slice on every tool call.
+	userMap := make(map[string]config.UserConfig, len(configuredUsers))
+	for _, u := range configuredUsers {
+		userMap[u.ID] = u
+	}
+
 	server := mcp.NewServer(&mcp.Implementation{Name: serverName, Version: serverVersion}, nil)
 
 	mcp.AddTool(server, &mcp.Tool{
@@ -48,7 +57,7 @@ func New(store *diary.Store, embedder embedding.Embedder, cfg config.SearchConfi
 			"Use tags to group related entries (e.g. [\"work\", \"idea\"])." +
 			userHint +
 			" Returns the record ID and timestamp of the saved entry.",
-	}, addRecordHandler(store, embedder, users, logger))
+	}, addRecordHandler(store, embedder, users, userMap, logger))
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name: "search",
@@ -57,7 +66,7 @@ func New(store *diary.Store, embedder embedding.Embedder, cfg config.SearchConfi
 			"Returns matching records ranked by relevance with their content, tags, date, and similarity score. " +
 			"Use limit to control how many results to return (default: " + fmt.Sprint(cfg.DefaultLimit) + ", max: " + fmt.Sprint(cfg.MaxLimit) + ")." +
 			userHint,
-	}, searchHandler(store, embedder, cfg, users, logger))
+	}, searchHandler(store, embedder, cfg, users, userMap, logger))
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name: "remove",
@@ -65,7 +74,7 @@ func New(store *diary.Store, embedder embedding.Embedder, cfg config.SearchConfi
 			"The ID is returned by add_record and appears in search results. " +
 			"Returns whether a record was actually deleted (false means the ID was not found)." +
 			userHint,
-	}, removeHandler(store, users, logger))
+	}, removeHandler(store, users, userMap, logger))
 
 	return server
 }
@@ -85,12 +94,33 @@ func resolveUser(users []string, action, userID string) (string, error) {
 	return userID, nil
 }
 
-// --- diary_add_record ---
+// parseEncryptionKey decodes a hex-encoded 32-byte encryption key. Returns nil
+// when raw is empty (no key provided). Returns an error for any non-empty
+// string that is not exactly 64 lowercase hex characters.
+func parseEncryptionKey(raw string) ([]byte, error) {
+	if raw == "" {
+		return nil, nil
+	}
+	key, err := hex.DecodeString(raw)
+	if err != nil || len(key) != 32 {
+		return nil, fmt.Errorf("record_encryption_key must be 64 lowercase hex characters (32 bytes)")
+	}
+	return key, nil
+}
+
+// --- add_record ---
 
 type AddRecordInput struct {
 	UserID  string   `json:"user_id" jsonschema:"The identifier of the user whose diary to write to. Must be one of the configured users."`
 	Content string   `json:"content" jsonschema:"The text content of the diary entry — a thought, event, note, or any information to remember."`
 	Tags    []string `json:"tags,omitempty" jsonschema:"Optional list of tags to categorize the entry, e.g. [\"work\", \"idea\", \"meeting\"]."`
+	// RecordEncryptionKey is the AES-256 key for this user's diary records,
+	// hex-encoded (64 lowercase hex characters = 32 bytes). Miranda provides
+	// this automatically based on the authenticated user's session key. Required
+	// when encryption is enabled for the user in server config; ignored otherwise.
+	// The field name record_encryption_key is the agreed trigger for Miranda's
+	// encryption-key injection whitelist — do not rename it.
+	RecordEncryptionKey string `json:"record_encryption_key,omitempty" jsonschema:"AES-256 encryption key for this user's diary records, hex-encoded (64 lowercase hex characters = 32 bytes). Miranda provides this automatically from the user's authenticated session. Required when encryption is enabled for the user; ignored otherwise."`
 }
 
 type AddRecordOutput struct {
@@ -98,7 +128,7 @@ type AddRecordOutput struct {
 	CreatedAt string `json:"created_at"`
 }
 
-func addRecordHandler(store *diary.Store, embedder embedding.Embedder, users []string, logger *slog.Logger) mcp.ToolHandlerFor[AddRecordInput, AddRecordOutput] {
+func addRecordHandler(store *diary.Store, embedder embedding.Embedder, users []string, userMap map[string]config.UserConfig, logger *slog.Logger) mcp.ToolHandlerFor[AddRecordInput, AddRecordOutput] {
 	return func(ctx context.Context, _ *mcp.CallToolRequest, in AddRecordInput) (*mcp.CallToolResult, AddRecordOutput, error) {
 		userID, err := resolveUser(users, "add_record", in.UserID)
 		if err != nil {
@@ -108,12 +138,27 @@ func addRecordHandler(store *diary.Store, embedder embedding.Embedder, users []s
 			return nil, AddRecordOutput{}, fmt.Errorf("add_record: content must not be empty")
 		}
 
+		// Wrap immediately so the raw value cannot accidentally reach a log sink.
+		encKey := secret.New(in.RecordEncryptionKey)
+		keyBytes, err := parseEncryptionKey(encKey.Value())
+		if err != nil {
+			return nil, AddRecordOutput{}, fmt.Errorf("add_record: %w", err)
+		}
+
+		user := userMap[userID]
+		if user.Encryption && keyBytes == nil {
+			return nil, AddRecordOutput{}, fmt.Errorf("add_record: record_encryption_key is required for user %q (encryption is enabled)", userID)
+		}
+		if !user.Encryption {
+			keyBytes = nil // ignore any key the caller sent
+		}
+
 		emb, err := embedder.Embed(ctx, in.Content)
 		if err != nil {
 			return nil, AddRecordOutput{}, fmt.Errorf("add_record: generate embedding: %w", err)
 		}
 
-		rec, err := store.Add(ctx, userID, in.Content, in.Tags, emb)
+		rec, err := store.Add(ctx, userID, in.Content, in.Tags, emb, keyBytes)
 		if err != nil {
 			return nil, AddRecordOutput{}, fmt.Errorf("add_record: store record: %w", err)
 		}
@@ -123,6 +168,7 @@ func addRecordHandler(store *diary.Store, embedder embedding.Embedder, users []s
 			"id", rec.ID,
 			"content_bytes", len(in.Content),
 			"tags", in.Tags,
+			"encrypted", user.Encryption,
 		)
 
 		out := AddRecordOutput{
@@ -134,12 +180,13 @@ func addRecordHandler(store *diary.Store, embedder embedding.Embedder, users []s
 	}
 }
 
-// --- diary_search ---
+// --- search ---
 
 type SearchInput struct {
-	UserID string `json:"user_id" jsonschema:"The identifier of the user whose diary to search. Must be one of the configured users."`
-	Query  string `json:"query" jsonschema:"Natural-language search query. The search finds diary entries that are semantically similar to this text."`
-	Limit  int    `json:"limit,omitempty" jsonschema:"Maximum number of results to return. Defaults to the server's configured default; clamped to the server's maximum."`
+	UserID              string `json:"user_id" jsonschema:"The identifier of the user whose diary to search. Must be one of the configured users."`
+	Query               string `json:"query" jsonschema:"Natural-language search query. The search finds diary entries that are semantically similar to this text."`
+	Limit               int    `json:"limit,omitempty" jsonschema:"Maximum number of results to return. Defaults to the server's configured default; clamped to the server's maximum."`
+	RecordEncryptionKey string `json:"record_encryption_key,omitempty" jsonschema:"AES-256 encryption key for this user's diary records, hex-encoded (64 lowercase hex characters = 32 bytes). Miranda provides this automatically from the user's authenticated session. Required when encryption is enabled for the user; ignored otherwise."`
 }
 
 type SearchOutput struct {
@@ -155,7 +202,7 @@ type SearchResultItem struct {
 	Score     float64  `json:"score"`
 }
 
-func searchHandler(store *diary.Store, embedder embedding.Embedder, cfg config.SearchConfig, users []string, logger *slog.Logger) mcp.ToolHandlerFor[SearchInput, SearchOutput] {
+func searchHandler(store *diary.Store, embedder embedding.Embedder, cfg config.SearchConfig, users []string, userMap map[string]config.UserConfig, logger *slog.Logger) mcp.ToolHandlerFor[SearchInput, SearchOutput] {
 	return func(ctx context.Context, _ *mcp.CallToolRequest, in SearchInput) (*mcp.CallToolResult, SearchOutput, error) {
 		userID, err := resolveUser(users, "search", in.UserID)
 		if err != nil {
@@ -163,6 +210,20 @@ func searchHandler(store *diary.Store, embedder embedding.Embedder, cfg config.S
 		}
 		if strings.TrimSpace(in.Query) == "" {
 			return nil, SearchOutput{}, fmt.Errorf("search: query must not be empty")
+		}
+
+		encKey := secret.New(in.RecordEncryptionKey)
+		keyBytes, err := parseEncryptionKey(encKey.Value())
+		if err != nil {
+			return nil, SearchOutput{}, fmt.Errorf("search: %w", err)
+		}
+
+		user := userMap[userID]
+		if user.Encryption && keyBytes == nil {
+			return nil, SearchOutput{}, fmt.Errorf("search: record_encryption_key is required for user %q (encryption is enabled)", userID)
+		}
+		if !user.Encryption {
+			keyBytes = nil
 		}
 
 		limit := in.Limit
@@ -178,7 +239,7 @@ func searchHandler(store *diary.Store, embedder embedding.Embedder, cfg config.S
 			return nil, SearchOutput{}, fmt.Errorf("search: generate query embedding: %w", err)
 		}
 
-		results, err := store.Search(ctx, userID, emb, limit)
+		results, err := store.Search(ctx, userID, emb, limit, keyBytes)
 		if err != nil {
 			return nil, SearchOutput{}, fmt.Errorf("search: store: %w", err)
 		}
@@ -223,18 +284,19 @@ func formatSearchResults(items []SearchResultItem) string {
 	return b.String()
 }
 
-// --- diary_remove ---
+// --- remove ---
 
 type RemoveInput struct {
-	UserID string `json:"user_id" jsonschema:"The identifier of the user who owns the record. Must be one of the configured users."`
-	ID     string `json:"id" jsonschema:"The ID of the diary record to delete, as returned by add_record or search."`
+	UserID              string `json:"user_id" jsonschema:"The identifier of the user who owns the record. Must be one of the configured users."`
+	ID                  string `json:"id" jsonschema:"The ID of the diary record to delete, as returned by add_record or search."`
+	RecordEncryptionKey string `json:"record_encryption_key,omitempty" jsonschema:"AES-256 encryption key for this user's diary records, hex-encoded (64 lowercase hex characters = 32 bytes). Miranda provides this automatically from the user's authenticated session. Required when encryption is enabled for the user; ignored otherwise."`
 }
 
 type RemoveOutput struct {
 	Deleted bool `json:"deleted"`
 }
 
-func removeHandler(store *diary.Store, users []string, logger *slog.Logger) mcp.ToolHandlerFor[RemoveInput, RemoveOutput] {
+func removeHandler(store *diary.Store, users []string, userMap map[string]config.UserConfig, logger *slog.Logger) mcp.ToolHandlerFor[RemoveInput, RemoveOutput] {
 	return func(ctx context.Context, _ *mcp.CallToolRequest, in RemoveInput) (*mcp.CallToolResult, RemoveOutput, error) {
 		userID, err := resolveUser(users, "remove", in.UserID)
 		if err != nil {
@@ -244,7 +306,21 @@ func removeHandler(store *diary.Store, users []string, logger *slog.Logger) mcp.
 			return nil, RemoveOutput{}, fmt.Errorf("remove: id must not be empty")
 		}
 
-		deleted, err := store.Remove(ctx, userID, in.ID)
+		encKey := secret.New(in.RecordEncryptionKey)
+		keyBytes, err := parseEncryptionKey(encKey.Value())
+		if err != nil {
+			return nil, RemoveOutput{}, fmt.Errorf("remove: %w", err)
+		}
+
+		user := userMap[userID]
+		if user.Encryption && keyBytes == nil {
+			return nil, RemoveOutput{}, fmt.Errorf("remove: record_encryption_key is required for user %q (encryption is enabled)", userID)
+		}
+		if !user.Encryption {
+			keyBytes = nil
+		}
+
+		deleted, err := store.Remove(ctx, userID, in.ID, keyBytes)
 		if err != nil {
 			return nil, RemoveOutput{}, fmt.Errorf("remove: %w", err)
 		}

@@ -31,14 +31,16 @@
 # household members every tool call's user_id is checked against (Miranda's
 # own userID for each household member — see config.Config.Users). Left
 # unset, the service refuses to start rather than run with no allowlist at
-# all. It's a list of objects, not bare strings, so future per-user settings
-# (e.g. a per-user encryption key reference) can be added without another
-# breaking config change. This repo's own template intentionally does not
-# hardcode real household member ids — set the real list only in the
-# server's own config.yaml (not touched by deploy, see CLAUDE.md), e.g.:
+# all. It's a list of objects, not bare strings, so per-user settings can
+# be added without another breaking config change. This repo's own template
+# intentionally does not hardcode real household member ids — set the real
+# list only in the server's own config.yaml (not touched by deploy, see
+# CLAUDE.md), e.g.:
 # users:
 #   - id: "alice"
+#     encryption: false  # set to true to require AES-256-GCM encryption for this user's records
 #   - id: "bob"
+#     encryption: false
 
 logging:
   level: "info"

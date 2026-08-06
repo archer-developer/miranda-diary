@@ -23,15 +23,20 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// UserConfig describes one household member allowed to use the diary. Only
-// ID is used today, but this is a struct rather than a bare string so future
-// per-user settings (e.g. the planned per-user biometric encryption key
-// reference — see CLAUDE.md) can be added as new fields without another
-// breaking change to the users config key.
+// UserConfig describes one household member allowed to use the diary. It is a
+// struct rather than a bare string so per-user settings can be added as new
+// fields without another breaking change to the users config key.
 type UserConfig struct {
 	// ID is the user_id value every tool call is checked against. See
 	// mcpserver.resolveUser.
 	ID string `yaml:"id"`
+	// Encryption enables AES-256-GCM encryption of diary record content for
+	// this user. When true, every tool call must supply record_encryption_key
+	// (a hex-encoded 32-byte key); the server validates it against a stored
+	// sentinel before any read or write. The key itself is never stored —
+	// only the sentinel. Embeddings are kept unencrypted so semantic search
+	// continues to work. See internal/diary/crypto.go.
+	Encryption bool `yaml:"encryption"`
 }
 
 // Config is the root of the service's configuration tree.
