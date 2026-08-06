@@ -107,7 +107,7 @@ func run(cfg config.Config, logger *slog.Logger) error {
 		return fmt.Errorf("main: init gemini embedder: %w", err)
 	}
 
-	server := mcpserver.New(store, embedder, cfg.Search, logger)
+	server := mcpserver.New(store, embedder, cfg.Search, cfg.KnownUsers, logger)
 	mcpHandler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return server }, nil)
 	handler := httpserver.New(mcpHandler, token)
 	httpServer := &http.Server{Addr: cfg.HTTPAddr, Handler: handler}

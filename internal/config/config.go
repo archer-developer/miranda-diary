@@ -9,6 +9,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -20,7 +21,15 @@ type Config struct {
 	Database     DatabaseConfig  `yaml:"database"`
 	Embedding    EmbeddingConfig `yaml:"embedding"`
 	Search       SearchConfig    `yaml:"search"`
-	Logging      LoggingConfig   `yaml:"logging"`
+	// KnownUsers is the closed set of user_id values every tool call is
+	// checked against. This diary has no per-user credentials the way
+	// miranda-yazio does, so nothing else would ever catch a caller (i.e.
+	// Miranda's LLM) passing the wrong household member's id — with no
+	// validation, a typo or a wrong-but-plausible id doesn't error, it just
+	// silently opens a new, unsearchable user_id bucket. See
+	// mcpserver.resolveUser.
+	KnownUsers []string      `yaml:"known_users"`
+	Logging    LoggingConfig `yaml:"logging"`
 }
 
 // DatabaseConfig controls the SQLite database file location.
@@ -73,6 +82,10 @@ func Default() Config {
 			DefaultLimit: 10,
 			MaxLimit:     50,
 		},
+		// KnownUsers has no default value — who's in the household isn't
+		// something to bake into source code, unlike every other field
+		// here. config.yaml must set known_users explicitly; see validate().
+		KnownUsers: nil,
 		Logging: LoggingConfig{
 			Level: "info",
 		},
@@ -80,20 +93,30 @@ func Default() Config {
 }
 
 // Load reads the YAML file at path and merges it over Default(). A missing
-// file is not an error — defaults are used as-is.
+// file is not a read error — defaults are used as-is — but validate() still
+// runs either way: unlike every other field, KnownUsers has no built-in
+// default (see Default()), so a genuinely missing/empty config.yaml must
+// fail fast at startup here, not silently start a server that then rejects
+// every tool call at request time.
 func Load(path string) (Config, error) {
 	cfg := Default()
 
 	data, err := os.ReadFile(path)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return cfg, nil
+		if !os.IsNotExist(err) {
+			return cfg, fmt.Errorf("config: read %s: %w", path, err)
 		}
-		return cfg, fmt.Errorf("config: read %s: %w", path, err)
+	} else if err := yaml.Unmarshal(data, &cfg); err != nil {
+		return cfg, fmt.Errorf("config: parse %s: %w", path, err)
 	}
 
-	if err := yaml.Unmarshal(data, &cfg); err != nil {
-		return cfg, fmt.Errorf("config: parse %s: %w", path, err)
+	// A hand-edited YAML scalar can carry stray whitespace; every tool
+	// call's user_id is trimmed before the allowlist check (see
+	// mcpserver.resolveUser), so an untrimmed entry here would make that
+	// user permanently unreachable — normalize before validate() so the
+	// trimmed form is also what duplicate-detection compares.
+	for i := range cfg.KnownUsers {
+		cfg.KnownUsers[i] = strings.TrimSpace(cfg.KnownUsers[i])
 	}
 
 	if err := cfg.validate(); err != nil {
@@ -124,6 +147,19 @@ func (c Config) validate() error {
 	}
 	if c.Search.MaxLimit < c.Search.DefaultLimit {
 		return fmt.Errorf("config: search.max_limit must be >= default_limit")
+	}
+	if len(c.KnownUsers) == 0 {
+		return fmt.Errorf("config: known_users must not be empty — list every household member's user_id explicitly in config.yaml")
+	}
+	seen := make(map[string]bool, len(c.KnownUsers))
+	for i, u := range c.KnownUsers {
+		if u == "" {
+			return fmt.Errorf("config: known_users[%d] must not be empty", i)
+		}
+		if seen[u] {
+			return fmt.Errorf("config: known_users[%d] %q is a duplicate — entries must be unique", i, u)
+		}
+		seen[u] = true
 	}
 	return nil
 }

@@ -65,6 +65,25 @@ per-user tokens and sets up the right structure for the planned future addition 
 per-user biometric encryption — at that point `user_id` → decryption key, and the
 tool call already carries it.
 
+**`user_id` is validated against `config.KnownUsers`, not free text.** Every
+tool handler runs `mcpserver.resolveUser` before touching the store — an
+empty or unrecognized `user_id` is a hard error, not a value the store
+silently accepts. This was added after a real incident: Miranda's system
+prompt used to only tell the LLM the current speaker's *display name*, not
+the technical id it must pass as `user_id`; for one household member the two
+happened to coincide well enough by lexical accident that the bug went
+unnoticed, for another they didn't, and food/diary tool calls silently
+landed under the wrong person's data with no error at any layer. The fix is
+two-layered: Miranda's own prompt now spells out the id explicitly (see
+Miranda's `internal/httpapi/agent_loop.go`), and this validation exists so
+that *if* a caller ever gets it wrong again anyway — a typo, a stale prompt,
+a different future caller — it fails loudly instead of silently starting a
+new, unsearchable `user_id` bucket. `known_users` has no built-in default
+(see `config.Default`) specifically so a deployment can't accidentally run
+with no allowlist at all; it must be set explicitly in the server's own
+`config.yaml` (never committed with real household member names — see that
+file's own template comment).
+
 ### Embedding storage
 
 Embeddings are stored as raw binary BLOBs in SQLite:

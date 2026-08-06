@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
 	"time"
 
@@ -22,11 +23,16 @@ const (
 )
 
 // New builds and returns the MCP server with all three diary tools registered.
-// A nil logger falls back to slog.Default().
-func New(store *diary.Store, embedder embedding.Embedder, cfg config.SearchConfig, logger *slog.Logger) *mcp.Server {
+// knownUsers is the closed set of valid user_id values (config.Config.KnownUsers)
+// — every handler rejects a call whose user_id isn't in this set, see
+// resolveUser. A nil logger falls back to slog.Default().
+func New(store *diary.Store, embedder embedding.Embedder, cfg config.SearchConfig, knownUsers []string, logger *slog.Logger) *mcp.Server {
 	if logger == nil {
 		logger = slog.Default()
 	}
+
+	users := slices.Sorted(slices.Values(knownUsers))
+	userHint := fmt.Sprintf(" user_id must be one of the configured users: %s.", strings.Join(users, ", "))
 
 	server := mcp.NewServer(&mcp.Implementation{Name: serverName, Version: serverVersion}, nil)
 
@@ -34,32 +40,50 @@ func New(store *diary.Store, embedder embedding.Embedder, cfg config.SearchConfi
 		Name: "add_record",
 		Description: "Save a thought, event, note, or any piece of information to the personal diary. " +
 			"The record is stored with a semantic embedding so it can be found later by meaning, not just keywords. " +
-			"Use tags to group related entries (e.g. [\"work\", \"idea\"]). " +
-			"Returns the record ID and timestamp of the saved entry.",
-	}, addRecordHandler(store, embedder, logger))
+			"Use tags to group related entries (e.g. [\"work\", \"idea\"])." +
+			userHint +
+			" Returns the record ID and timestamp of the saved entry.",
+	}, addRecordHandler(store, embedder, users, logger))
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name: "search",
 		Description: "Search the personal diary by meaning. " +
 			"Pass a natural-language query — the search finds semantically similar entries even when they use different words. " +
 			"Returns matching records ranked by relevance with their content, tags, date, and similarity score. " +
-			"Use limit to control how many results to return (default: " + fmt.Sprint(cfg.DefaultLimit) + ", max: " + fmt.Sprint(cfg.MaxLimit) + ").",
-	}, searchHandler(store, embedder, cfg, logger))
+			"Use limit to control how many results to return (default: " + fmt.Sprint(cfg.DefaultLimit) + ", max: " + fmt.Sprint(cfg.MaxLimit) + ")." +
+			userHint,
+	}, searchHandler(store, embedder, cfg, users, logger))
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name: "remove",
 		Description: "Delete a diary record by its ID. " +
 			"The ID is returned by add_record and appears in search results. " +
-			"Returns whether a record was actually deleted (false means the ID was not found).",
-	}, removeHandler(store, logger))
+			"Returns whether a record was actually deleted (false means the ID was not found)." +
+			userHint,
+	}, removeHandler(store, users, logger))
 
 	return server
+}
+
+// resolveUser trims userID and checks it against users (the sorted list
+// New() already computed once). An empty or unrecognized user_id is a
+// caller error, not something worth guessing a default for — see
+// config.Config.KnownUsers for why this can't just accept anything.
+func resolveUser(users []string, action, userID string) (string, error) {
+	userID = strings.TrimSpace(userID)
+	if userID == "" {
+		return "", fmt.Errorf("%s: user_id is required; configured users: %s", action, strings.Join(users, ", "))
+	}
+	if !slices.Contains(users, userID) {
+		return "", fmt.Errorf("%s: unknown user_id %q; configured users: %s", action, userID, strings.Join(users, ", "))
+	}
+	return userID, nil
 }
 
 // --- diary_add_record ---
 
 type AddRecordInput struct {
-	UserID  string   `json:"user_id" jsonschema:"The identifier of the user whose diary to write to (e.g. \"alexander\")."`
+	UserID  string   `json:"user_id" jsonschema:"The identifier of the user whose diary to write to. Must be one of the configured users."`
 	Content string   `json:"content" jsonschema:"The text content of the diary entry — a thought, event, note, or any information to remember."`
 	Tags    []string `json:"tags,omitempty" jsonschema:"Optional list of tags to categorize the entry, e.g. [\"work\", \"idea\", \"meeting\"]."`
 }
@@ -69,10 +93,11 @@ type AddRecordOutput struct {
 	CreatedAt string `json:"created_at"`
 }
 
-func addRecordHandler(store *diary.Store, embedder embedding.Embedder, logger *slog.Logger) mcp.ToolHandlerFor[AddRecordInput, AddRecordOutput] {
+func addRecordHandler(store *diary.Store, embedder embedding.Embedder, users []string, logger *slog.Logger) mcp.ToolHandlerFor[AddRecordInput, AddRecordOutput] {
 	return func(ctx context.Context, _ *mcp.CallToolRequest, in AddRecordInput) (*mcp.CallToolResult, AddRecordOutput, error) {
-		if strings.TrimSpace(in.UserID) == "" {
-			return nil, AddRecordOutput{}, fmt.Errorf("add_record: user_id must not be empty")
+		userID, err := resolveUser(users, "add_record", in.UserID)
+		if err != nil {
+			return nil, AddRecordOutput{}, err
 		}
 		if strings.TrimSpace(in.Content) == "" {
 			return nil, AddRecordOutput{}, fmt.Errorf("add_record: content must not be empty")
@@ -83,13 +108,13 @@ func addRecordHandler(store *diary.Store, embedder embedding.Embedder, logger *s
 			return nil, AddRecordOutput{}, fmt.Errorf("add_record: generate embedding: %w", err)
 		}
 
-		rec, err := store.Add(ctx, in.UserID, in.Content, in.Tags, emb)
+		rec, err := store.Add(ctx, userID, in.Content, in.Tags, emb)
 		if err != nil {
 			return nil, AddRecordOutput{}, fmt.Errorf("add_record: store record: %w", err)
 		}
 
 		logger.Info("add_record",
-			"user_id", in.UserID,
+			"user_id", userID,
 			"id", rec.ID,
 			"content_bytes", len(in.Content),
 			"tags", in.Tags,
@@ -107,7 +132,7 @@ func addRecordHandler(store *diary.Store, embedder embedding.Embedder, logger *s
 // --- diary_search ---
 
 type SearchInput struct {
-	UserID string `json:"user_id" jsonschema:"The identifier of the user whose diary to search (e.g. \"alexander\")."`
+	UserID string `json:"user_id" jsonschema:"The identifier of the user whose diary to search. Must be one of the configured users."`
 	Query  string `json:"query" jsonschema:"Natural-language search query. The search finds diary entries that are semantically similar to this text."`
 	Limit  int    `json:"limit,omitempty" jsonschema:"Maximum number of results to return. Defaults to the server's configured default; clamped to the server's maximum."`
 }
@@ -125,10 +150,11 @@ type SearchResultItem struct {
 	Score     float64  `json:"score"`
 }
 
-func searchHandler(store *diary.Store, embedder embedding.Embedder, cfg config.SearchConfig, logger *slog.Logger) mcp.ToolHandlerFor[SearchInput, SearchOutput] {
+func searchHandler(store *diary.Store, embedder embedding.Embedder, cfg config.SearchConfig, users []string, logger *slog.Logger) mcp.ToolHandlerFor[SearchInput, SearchOutput] {
 	return func(ctx context.Context, _ *mcp.CallToolRequest, in SearchInput) (*mcp.CallToolResult, SearchOutput, error) {
-		if strings.TrimSpace(in.UserID) == "" {
-			return nil, SearchOutput{}, fmt.Errorf("search: user_id must not be empty")
+		userID, err := resolveUser(users, "search", in.UserID)
+		if err != nil {
+			return nil, SearchOutput{}, err
 		}
 		if strings.TrimSpace(in.Query) == "" {
 			return nil, SearchOutput{}, fmt.Errorf("search: query must not be empty")
@@ -147,13 +173,13 @@ func searchHandler(store *diary.Store, embedder embedding.Embedder, cfg config.S
 			return nil, SearchOutput{}, fmt.Errorf("search: generate query embedding: %w", err)
 		}
 
-		results, err := store.Search(ctx, in.UserID, emb, limit)
+		results, err := store.Search(ctx, userID, emb, limit)
 		if err != nil {
 			return nil, SearchOutput{}, fmt.Errorf("search: store: %w", err)
 		}
 
 		logger.Info("search",
-			"user_id", in.UserID,
+			"user_id", userID,
 			"query_len", len(in.Query),
 			"limit", limit,
 			"found", len(results),
@@ -195,7 +221,7 @@ func formatSearchResults(items []SearchResultItem) string {
 // --- diary_remove ---
 
 type RemoveInput struct {
-	UserID string `json:"user_id" jsonschema:"The identifier of the user who owns the record (e.g. \"alexander\")."`
+	UserID string `json:"user_id" jsonschema:"The identifier of the user who owns the record. Must be one of the configured users."`
 	ID     string `json:"id" jsonschema:"The ID of the diary record to delete, as returned by add_record or search."`
 }
 
@@ -203,21 +229,22 @@ type RemoveOutput struct {
 	Deleted bool `json:"deleted"`
 }
 
-func removeHandler(store *diary.Store, logger *slog.Logger) mcp.ToolHandlerFor[RemoveInput, RemoveOutput] {
+func removeHandler(store *diary.Store, users []string, logger *slog.Logger) mcp.ToolHandlerFor[RemoveInput, RemoveOutput] {
 	return func(ctx context.Context, _ *mcp.CallToolRequest, in RemoveInput) (*mcp.CallToolResult, RemoveOutput, error) {
-		if strings.TrimSpace(in.UserID) == "" {
-			return nil, RemoveOutput{}, fmt.Errorf("remove: user_id must not be empty")
+		userID, err := resolveUser(users, "remove", in.UserID)
+		if err != nil {
+			return nil, RemoveOutput{}, err
 		}
 		if strings.TrimSpace(in.ID) == "" {
 			return nil, RemoveOutput{}, fmt.Errorf("remove: id must not be empty")
 		}
 
-		deleted, err := store.Remove(ctx, in.UserID, in.ID)
+		deleted, err := store.Remove(ctx, userID, in.ID)
 		if err != nil {
 			return nil, RemoveOutput{}, fmt.Errorf("remove: %w", err)
 		}
 
-		logger.Info("remove", "user_id", in.UserID, "id", in.ID, "deleted", deleted)
+		logger.Info("remove", "user_id", userID, "id", in.ID, "deleted", deleted)
 
 		out := RemoveOutput{Deleted: deleted}
 		var text string
