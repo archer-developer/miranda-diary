@@ -81,6 +81,85 @@ ssh archer@miranda 'mkdir -p ~/miranda-diary'
 # then create ~/miranda-diary/.env with DIARY_MCP_TOKEN and GEMINI_API_KEY
 ```
 
+## Trusting the TLS certificate
+
+TLS is enabled by default. On first start the server generates a self-signed
+certificate at `data/tls/cert.pem` (relative to its working directory —
+`~/miranda-diary/data/tls/cert.pem` on the server). The certificate is reused
+on every subsequent start; it is never rotated automatically, so the client
+trust store only needs to be updated once.
+
+Any HTTPS client calling the diary — including Miranda itself when it runs on
+the same host — must trust this certificate. Because adding a certificate to
+the OS trust store requires elevated privileges the server cannot do this
+itself; it must be done once by hand after the first start.
+
+### Linux (Debian / Ubuntu)
+
+```bash
+# Copy cert from server if updating a remote client
+scp archer@miranda:~/miranda-diary/data/tls/cert.pem /tmp/miranda-diary.crt
+
+sudo cp /tmp/miranda-diary.crt /usr/local/share/ca-certificates/miranda-diary.crt
+sudo update-ca-certificates
+```
+
+### Linux (RHEL / Fedora / CentOS / Alma)
+
+```bash
+scp archer@miranda:~/miranda-diary/data/tls/cert.pem /tmp/miranda-diary.crt
+
+sudo cp /tmp/miranda-diary.crt /etc/pki/ca-trust/source/anchors/miranda-diary.crt
+sudo update-ca-trust
+```
+
+### macOS
+
+```bash
+scp archer@miranda:~/miranda-diary/data/tls/cert.pem /tmp/miranda-diary.pem
+
+sudo security add-trusted-cert -d -r trustRoot \
+    -k /Library/Keychains/System.keychain /tmp/miranda-diary.pem
+```
+
+To verify: open **Keychain Access → System → Certificates** and find
+`miranda-diary`; it should show a blue `+` (trusted).
+
+### Windows
+
+```powershell
+# Copy the cert to the local machine first, then in an elevated PowerShell:
+certutil -addstore -f "ROOT" C:\path\to\cert.pem
+```
+
+Alternatively: double-click `cert.pem` → **Install Certificate** →
+**Local Machine** → **Place all certificates in the following store** →
+**Trusted Root Certification Authorities**.
+
+### Miranda running on the same Linux server
+
+If Miranda itself runs on the same host as miranda-diary (the typical
+home-server setup), it is the client that needs to trust the cert. Run the
+Linux steps above **on the server** as the `archer` user:
+
+```bash
+# On the server, after the first diary service start:
+sudo cp ~/miranda-diary/data/tls/cert.pem /usr/local/share/ca-certificates/miranda-diary.crt
+sudo update-ca-certificates
+```
+
+After trusting the certificate, update Miranda's `config/mcp.yaml` to use
+`https://` instead of `http://`:
+
+```yaml
+mcp:
+  servers:
+    - name: diary
+      url: "https://miranda:8789/mcp"
+      token_env: "DIARY_MCP_TOKEN"
+      enabled: true
+```
+
 ## Configuration
 
 Every field has a built-in default (see `internal/config.Default()`).
@@ -148,10 +227,13 @@ Add an entry to Miranda's `config/mcp.yaml`:
 mcp:
   servers:
     - name: diary
-      url: "http://miranda:8789/mcp"
+      url: "https://miranda:8789/mcp"
       token_env: "DIARY_MCP_TOKEN"
       enabled: true
 ```
+
+TLS is on by default (see "Trusting the TLS certificate" above) — the `https://`
+URL only works once Miranda's client trusts the diary's self-signed certificate.
 
 and set `DIARY_MCP_TOKEN` in Miranda's `.env` to the same value configured
 here. Miranda will then expose the tools as `diary_add_record`,

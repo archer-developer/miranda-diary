@@ -75,9 +75,23 @@ func decryptContent(key, nonce, ciphertext []byte) (string, error) {
 // inserts the result. Subsequent calls: decrypts the stored sentinel and checks
 // that it matches — a mismatch means the wrong key was submitted and an error
 // is returned.
+//
+// The SELECT and the first-use INSERT run inside one transaction so they hold
+// the store's single pooled connection (see store.go's SetMaxOpenConns(1))
+// for the whole check-then-act sequence — without that, two concurrent first
+// calls for the same brand-new user_id could both observe sql.ErrNoRows
+// before either INSERTs, and the second INSERT would fail on the user_id
+// primary key instead of cleanly reporting a wrong key. This correctness
+// argument depends on the pool staying capped at one connection.
 func verifyOrInitKeyCheck(ctx context.Context, db *sql.DB, userID string, key []byte) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("diary: begin key check: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }() // no-op once committed
+
 	var checkNonce, checkCipher []byte
-	err := db.QueryRowContext(ctx,
+	err = tx.QueryRowContext(ctx,
 		`SELECT check_nonce, check_cipher FROM user_key_checks WHERE user_id = ?`,
 		userID,
 	).Scan(&checkNonce, &checkCipher)
@@ -88,17 +102,20 @@ func verifyOrInitKeyCheck(ctx context.Context, db *sql.DB, userID string, key []
 		if err != nil {
 			return fmt.Errorf("diary: init key check: %w", err)
 		}
-		_, err = db.ExecContext(ctx,
+		_, err = tx.ExecContext(ctx,
 			`INSERT INTO user_key_checks (user_id, check_nonce, check_cipher) VALUES (?, ?, ?)`,
 			userID, nonce, ciphertext,
 		)
 		if err != nil {
 			return fmt.Errorf("diary: store key check: %w", err)
 		}
-		return nil
+		return tx.Commit()
 	}
 	if err != nil {
 		return fmt.Errorf("diary: load key check: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("diary: commit key check: %w", err)
 	}
 
 	// Validate: if decryption succeeds and the plaintext matches, the key is correct.

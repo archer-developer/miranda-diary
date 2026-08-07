@@ -16,6 +16,20 @@
 # http_addr: ":8789"
 # auth_token_env: "DIARY_MCP_TOKEN"
 
+# tls: Miranda's tool calls carry a per-user record_encryption_key once
+# encryption is enabled for that user (see users[].encryption below), so the
+# transport needs to be encrypted even though both services currently run on
+# the same host over loopback. On by default. The server generates and
+# reuses its own self-signed certificate at cert_file/key_file on first
+# start — see internal/tlscert.EnsureSelfSigned — rather than requiring a
+# CA-issued one, since this link never leaves localhost and has no public
+# DNS name. hosts is the certificate's Subject Alternative Names list.
+# tls:
+#   enabled: true
+#   cert_file: "data/tls/cert.pem"
+#   key_file: "data/tls/key.pem"
+#   hosts: ["127.0.0.1", "localhost"]
+
 # database:
 #   path: "data/diary.db"
 

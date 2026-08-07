@@ -138,6 +138,15 @@ func (s *Store) Add(ctx context.Context, userID, content string, tags []string, 
 	return Record{ID: id, Content: content, Tags: tags, CreatedAt: now}, nil
 }
 
+// VerifyEncryptionKey checks encryptionKey against userID's stored sentinel
+// (creating it on first use), without touching any record. Callers use this
+// to reject a wrong key before doing expensive work (e.g. a Gemini embedding
+// call) ahead of Add/Search, which each also run this same check internally
+// before actually reading or writing a record.
+func (s *Store) VerifyEncryptionKey(ctx context.Context, userID string, encryptionKey []byte) error {
+	return verifyOrInitKeyCheck(ctx, s.db, userID, encryptionKey)
+}
+
 // Search returns up to limit records owned by userID ranked by cosine
 // similarity to queryEmbedding. Only records belonging to userID are
 // considered. All matching records are loaded and scored in-memory; the caller
@@ -146,12 +155,13 @@ func (s *Store) Add(ctx context.Context, userID, content string, tags []string, 
 // When encryptionKey is non-nil, encrypted rows are decrypted before being
 // returned. A wrong key is detected early via the key sentinel and returns an
 // error. Encrypted rows encountered when encryptionKey is nil are skipped
-// silently (e.g. when encryption was enabled and then later disabled for a
-// user).
-func (s *Store) Search(ctx context.Context, userID string, queryEmbedding []float32, limit int, encryptionKey []byte) ([]SearchResult, error) {
+// rather than returned (e.g. when encryption was enabled and then later
+// disabled for a user); skippedEncrypted counts how many, so the caller can
+// surface that to whoever asked instead of it looking like "no matches."
+func (s *Store) Search(ctx context.Context, userID string, queryEmbedding []float32, limit int, encryptionKey []byte) (results []SearchResult, skippedEncrypted int, err error) {
 	if encryptionKey != nil {
 		if err := verifyOrInitKeyCheck(ctx, s.db, userID, encryptionKey); err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 	}
 
@@ -160,11 +170,10 @@ func (s *Store) Search(ctx context.Context, userID string, queryEmbedding []floa
 		userID,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("diary: query records: %w", err)
+		return nil, 0, fmt.Errorf("diary: query records: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
 
-	var results []SearchResult
 	for rows.Next() {
 		var (
 			id               string
@@ -176,7 +185,7 @@ func (s *Store) Search(ctx context.Context, userID string, queryEmbedding []floa
 			contentEncrypted int
 		)
 		if err := rows.Scan(&id, &contentBytes, &tagsJSON, &createdAt, &embBlob, &contentNonce, &contentEncrypted); err != nil {
-			return nil, fmt.Errorf("diary: scan row: %w", err)
+			return nil, 0, fmt.Errorf("diary: scan row: %w", err)
 		}
 
 		emb, err := decodeEmbedding(embBlob)
@@ -189,7 +198,9 @@ func (s *Store) Search(ctx context.Context, userID string, queryEmbedding []floa
 		if contentEncrypted == 1 {
 			if encryptionKey == nil {
 				// Encrypted row with no key — encryption was on, then disabled.
-				// Skip silently; the caller gets only the plaintext rows it can read.
+				// Skip it, but count it so the caller can tell the difference
+				// from "no matches" instead of it looking like data loss.
+				skippedEncrypted++
 				continue
 			}
 			if len(contentNonce) != gcmNonceSize {
@@ -225,7 +236,7 @@ func (s *Store) Search(ctx context.Context, userID string, queryEmbedding []floa
 		})
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("diary: iterate rows: %w", err)
+		return nil, 0, fmt.Errorf("diary: iterate rows: %w", err)
 	}
 
 	sort.Slice(results, func(i, j int) bool {
@@ -235,7 +246,7 @@ func (s *Store) Search(ctx context.Context, userID string, queryEmbedding []floa
 	if limit < len(results) {
 		results = results[:limit]
 	}
-	return results, nil
+	return results, skippedEncrypted, nil
 }
 
 // Remove deletes the record with the given id only if it belongs to userID.

@@ -41,6 +41,7 @@ import (
 	"github.com/archer-developer/miranda-diary/internal/envfile"
 	"github.com/archer-developer/miranda-diary/internal/httpserver"
 	"github.com/archer-developer/miranda-diary/internal/mcpserver"
+	"github.com/archer-developer/miranda-diary/internal/tlscert"
 )
 
 const (
@@ -166,6 +167,12 @@ func run(cfg config.Config, logger *slog.Logger) error {
 		return fmt.Errorf("main: init gemini embedder: %w", err)
 	}
 
+	if cfg.TLS.Enabled {
+		if err := tlscert.EnsureSelfSigned(cfg.TLS.CertFile, cfg.TLS.KeyFile, cfg.TLS.Hosts); err != nil {
+			return fmt.Errorf("main: prepare TLS certificate: %w", err)
+		}
+	}
+
 	server := mcpserver.New(store, embedder, cfg.Search, cfg.Users, logger)
 	mcpHandler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return server }, nil)
 	handler := httpserver.New(mcpHandler, token)
@@ -175,16 +182,21 @@ func run(cfg config.Config, logger *slog.Logger) error {
 		"path", cfg.Database.Path,
 		"embedding_model", cfg.Embedding.Model,
 		"addr", cfg.HTTPAddr,
+		"tls", cfg.TLS.Enabled,
 	)
 
-	return serveUntilInterrupted(ctx, httpServer, logger)
+	return serveUntilInterrupted(ctx, httpServer, cfg.TLS, logger)
 }
 
-func serveUntilInterrupted(ctx context.Context, httpServer *http.Server, logger *slog.Logger) error {
+func serveUntilInterrupted(ctx context.Context, httpServer *http.Server, tlsCfg config.TLSConfig, logger *slog.Logger) error {
 	errCh := make(chan error, 1)
 	go func() {
-		logger.Info("listening", "addr", httpServer.Addr)
-		errCh <- httpServer.ListenAndServe()
+		logger.Info("listening", "addr", httpServer.Addr, "tls", tlsCfg.Enabled)
+		if tlsCfg.Enabled {
+			errCh <- httpServer.ListenAndServeTLS(tlsCfg.CertFile, tlsCfg.KeyFile)
+		} else {
+			errCh <- httpServer.ListenAndServe()
+		}
 	}()
 
 	select {

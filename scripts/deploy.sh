@@ -62,8 +62,11 @@ echo "--- systemctl --user status $service_name ---"
 systemctl --user --no-pager -l status "$service_name" || true
 
 echo "--- health check ---"
+# -k: the server presents a self-signed certificate (see internal/tlscert),
+# so there's no CA chain for curl to verify here. TLS is still negotiated;
+# this only skips certificate validation for this local liveness probe.
 for i in 1 2 3 4 5; do
-  if curl -fsS -m 2 http://localhost:8789/healthz; then
+  if curl -fsSk -m 2 https://localhost:8789/healthz; then
     echo
     exit 0
   fi

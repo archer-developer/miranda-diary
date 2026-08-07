@@ -16,7 +16,6 @@ import (
 	"github.com/archer-developer/miranda-diary/internal/config"
 	"github.com/archer-developer/miranda-diary/internal/diary"
 	"github.com/archer-developer/miranda-diary/internal/embedding"
-	"github.com/archer-developer/miranda-diary/internal/secret"
 )
 
 const (
@@ -108,6 +107,25 @@ func parseEncryptionKey(raw string) ([]byte, error) {
 	return key, nil
 }
 
+// resolveEncryptionKey gates and parses raw (the caller-supplied
+// record_encryption_key) against user's encryption setting. When encryption
+// is disabled for user, raw is ignored entirely — not even format-checked —
+// matching the field's documented "ignored otherwise" contract. When enabled,
+// raw must decode to a valid key or the call is rejected.
+func resolveEncryptionKey(action string, user config.UserConfig, raw string) ([]byte, error) {
+	if !user.Encryption {
+		return nil, nil
+	}
+	keyBytes, err := parseEncryptionKey(raw)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", action, err)
+	}
+	if keyBytes == nil {
+		return nil, fmt.Errorf("%s: record_encryption_key is required for user %q (encryption is enabled)", action, user.ID)
+	}
+	return keyBytes, nil
+}
+
 // --- add_record ---
 
 type AddRecordInput struct {
@@ -130,6 +148,11 @@ type AddRecordOutput struct {
 
 func addRecordHandler(store *diary.Store, embedder embedding.Embedder, users []string, userMap map[string]config.UserConfig, logger *slog.Logger) mcp.ToolHandlerFor[AddRecordInput, AddRecordOutput] {
 	return func(ctx context.Context, _ *mcp.CallToolRequest, in AddRecordInput) (*mcp.CallToolResult, AddRecordOutput, error) {
+		// Scrub before any other handler code touches in, so a future change
+		// that logs the input struct directly can never leak the raw key.
+		rawKey := in.RecordEncryptionKey
+		in.RecordEncryptionKey = ""
+
 		userID, err := resolveUser(users, "add_record", in.UserID)
 		if err != nil {
 			return nil, AddRecordOutput{}, err
@@ -138,19 +161,18 @@ func addRecordHandler(store *diary.Store, embedder embedding.Embedder, users []s
 			return nil, AddRecordOutput{}, fmt.Errorf("add_record: content must not be empty")
 		}
 
-		// Wrap immediately so the raw value cannot accidentally reach a log sink.
-		encKey := secret.New(in.RecordEncryptionKey)
-		keyBytes, err := parseEncryptionKey(encKey.Value())
+		user := userMap[userID]
+		keyBytes, err := resolveEncryptionKey("add_record", user, rawKey)
 		if err != nil {
-			return nil, AddRecordOutput{}, fmt.Errorf("add_record: %w", err)
+			return nil, AddRecordOutput{}, err
 		}
 
-		user := userMap[userID]
-		if user.Encryption && keyBytes == nil {
-			return nil, AddRecordOutput{}, fmt.Errorf("add_record: record_encryption_key is required for user %q (encryption is enabled)", userID)
-		}
-		if !user.Encryption {
-			keyBytes = nil // ignore any key the caller sent
+		// Verify the key before the expensive embedding call, so a wrong key
+		// fails fast without burning a Gemini API round-trip.
+		if keyBytes != nil {
+			if err := store.VerifyEncryptionKey(ctx, userID, keyBytes); err != nil {
+				return nil, AddRecordOutput{}, fmt.Errorf("add_record: %w", err)
+			}
 		}
 
 		emb, err := embedder.Embed(ctx, in.Content)
@@ -192,6 +214,10 @@ type SearchInput struct {
 type SearchOutput struct {
 	Results []SearchResultItem `json:"results"`
 	Total   int                `json:"total"`
+	// SkippedEncrypted counts records that were not searched because they're
+	// encrypted and no key was supplied (e.g. encryption was enabled and
+	// later disabled for this user). Zero when nothing was skipped.
+	SkippedEncrypted int `json:"skipped_encrypted,omitempty"`
 }
 
 type SearchResultItem struct {
@@ -204,6 +230,9 @@ type SearchResultItem struct {
 
 func searchHandler(store *diary.Store, embedder embedding.Embedder, cfg config.SearchConfig, users []string, userMap map[string]config.UserConfig, logger *slog.Logger) mcp.ToolHandlerFor[SearchInput, SearchOutput] {
 	return func(ctx context.Context, _ *mcp.CallToolRequest, in SearchInput) (*mcp.CallToolResult, SearchOutput, error) {
+		rawKey := in.RecordEncryptionKey
+		in.RecordEncryptionKey = ""
+
 		userID, err := resolveUser(users, "search", in.UserID)
 		if err != nil {
 			return nil, SearchOutput{}, err
@@ -212,18 +241,16 @@ func searchHandler(store *diary.Store, embedder embedding.Embedder, cfg config.S
 			return nil, SearchOutput{}, fmt.Errorf("search: query must not be empty")
 		}
 
-		encKey := secret.New(in.RecordEncryptionKey)
-		keyBytes, err := parseEncryptionKey(encKey.Value())
+		user := userMap[userID]
+		keyBytes, err := resolveEncryptionKey("search", user, rawKey)
 		if err != nil {
-			return nil, SearchOutput{}, fmt.Errorf("search: %w", err)
+			return nil, SearchOutput{}, err
 		}
 
-		user := userMap[userID]
-		if user.Encryption && keyBytes == nil {
-			return nil, SearchOutput{}, fmt.Errorf("search: record_encryption_key is required for user %q (encryption is enabled)", userID)
-		}
-		if !user.Encryption {
-			keyBytes = nil
+		if keyBytes != nil {
+			if err := store.VerifyEncryptionKey(ctx, userID, keyBytes); err != nil {
+				return nil, SearchOutput{}, fmt.Errorf("search: %w", err)
+			}
 		}
 
 		limit := in.Limit
@@ -239,7 +266,7 @@ func searchHandler(store *diary.Store, embedder embedding.Embedder, cfg config.S
 			return nil, SearchOutput{}, fmt.Errorf("search: generate query embedding: %w", err)
 		}
 
-		results, err := store.Search(ctx, userID, emb, limit, keyBytes)
+		results, skipped, err := store.Search(ctx, userID, emb, limit, keyBytes)
 		if err != nil {
 			return nil, SearchOutput{}, fmt.Errorf("search: store: %w", err)
 		}
@@ -249,6 +276,7 @@ func searchHandler(store *diary.Store, embedder embedding.Embedder, cfg config.S
 			"query_len", len(in.Query),
 			"limit", limit,
 			"found", len(results),
+			"skipped_encrypted", skipped,
 		)
 
 		items := make([]SearchResultItem, len(results))
@@ -262,24 +290,28 @@ func searchHandler(store *diary.Store, embedder embedding.Embedder, cfg config.S
 			}
 		}
 
-		out := SearchOutput{Results: items, Total: len(items)}
-		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: formatSearchResults(items)}}}, out, nil
+		out := SearchOutput{Results: items, Total: len(items), SkippedEncrypted: skipped}
+		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: formatSearchResults(items, skipped)}}}, out, nil
 	}
 }
 
-func formatSearchResults(items []SearchResultItem) string {
-	if len(items) == 0 {
-		return "No matching diary entries found."
-	}
+func formatSearchResults(items []SearchResultItem, skippedEncrypted int) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "Found %d result(s):\n", len(items))
-	for i, item := range items {
-		fmt.Fprintf(&b, "\n--- #%d (id: %s, score: %.3f, date: %s) ---\n", i+1, item.ID, item.Score, item.CreatedAt)
-		if len(item.Tags) > 0 {
-			fmt.Fprintf(&b, "Tags: [%s]\n", strings.Join(item.Tags, ", "))
+	if len(items) == 0 {
+		b.WriteString("No matching diary entries found.")
+	} else {
+		fmt.Fprintf(&b, "Found %d result(s):\n", len(items))
+		for i, item := range items {
+			fmt.Fprintf(&b, "\n--- #%d (id: %s, score: %.3f, date: %s) ---\n", i+1, item.ID, item.Score, item.CreatedAt)
+			if len(item.Tags) > 0 {
+				fmt.Fprintf(&b, "Tags: [%s]\n", strings.Join(item.Tags, ", "))
+			}
+			b.WriteString(item.Content)
+			b.WriteString("\n")
 		}
-		b.WriteString(item.Content)
-		b.WriteString("\n")
+	}
+	if skippedEncrypted > 0 {
+		fmt.Fprintf(&b, "\nNote: %d further entries are encrypted and require your key; they were not searched.\n", skippedEncrypted)
 	}
 	return b.String()
 }
@@ -298,6 +330,9 @@ type RemoveOutput struct {
 
 func removeHandler(store *diary.Store, users []string, userMap map[string]config.UserConfig, logger *slog.Logger) mcp.ToolHandlerFor[RemoveInput, RemoveOutput] {
 	return func(ctx context.Context, _ *mcp.CallToolRequest, in RemoveInput) (*mcp.CallToolResult, RemoveOutput, error) {
+		rawKey := in.RecordEncryptionKey
+		in.RecordEncryptionKey = ""
+
 		userID, err := resolveUser(users, "remove", in.UserID)
 		if err != nil {
 			return nil, RemoveOutput{}, err
@@ -306,18 +341,10 @@ func removeHandler(store *diary.Store, users []string, userMap map[string]config
 			return nil, RemoveOutput{}, fmt.Errorf("remove: id must not be empty")
 		}
 
-		encKey := secret.New(in.RecordEncryptionKey)
-		keyBytes, err := parseEncryptionKey(encKey.Value())
-		if err != nil {
-			return nil, RemoveOutput{}, fmt.Errorf("remove: %w", err)
-		}
-
 		user := userMap[userID]
-		if user.Encryption && keyBytes == nil {
-			return nil, RemoveOutput{}, fmt.Errorf("remove: record_encryption_key is required for user %q (encryption is enabled)", userID)
-		}
-		if !user.Encryption {
-			keyBytes = nil
+		keyBytes, err := resolveEncryptionKey("remove", user, rawKey)
+		if err != nil {
+			return nil, RemoveOutput{}, err
 		}
 
 		deleted, err := store.Remove(ctx, userID, in.ID, keyBytes)

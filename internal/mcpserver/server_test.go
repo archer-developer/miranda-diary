@@ -165,4 +165,18 @@ func TestMCPServer_EncryptionRequired(t *testing.T) {
 		require.NoError(t, err)
 		assert.NotEmpty(t, out.ID)
 	})
+
+	// Regression test: record_encryption_key is documented as "ignored" for a
+	// user without encryption enabled — a malformed value must not be
+	// format-validated (and so must not reject the call) in that case.
+	t.Run("non-encrypted user with malformed key still succeeds", func(t *testing.T) {
+		h := addRecordHandler(store, fakeEmbedder{}, testUsers, encUserMap, logger)
+		_, out, err := h(context.Background(), &mcp.CallToolRequest{}, AddRecordInput{
+			UserID:              "anna",
+			Content:             "anna's other note",
+			RecordEncryptionKey: "not-a-valid-key",
+		})
+		require.NoError(t, err)
+		assert.NotEmpty(t, out.ID)
+	})
 }

@@ -17,7 +17,7 @@ the same `Default()`-in-Go + YAML-overrides pattern as
 ## Architecture
 
 ```
-Miranda <--Streamable HTTP (bearer token)--> httpserver
+Miranda <--Streamable HTTPS (bearer token)--> httpserver
                                                   |
                                              mcpserver
                                            /     |     \
@@ -53,6 +53,42 @@ file on top of it in turn — later files override earlier ones
 field-by-field. A missing file or missing config directory is not an error;
 `validate()` at the end of `Load()` is what rejects a config that's missing
 something required (like `users` — see User isolation below).
+
+### TLS / HTTPS
+
+The HTTP server listens with TLS by default (`tls.enabled`, on unless
+explicitly turned off — see `config.yaml.dist`). This exists because
+per-user encryption (`users[].encryption`, see Encryption at rest below)
+means `record_encryption_key` — the AES key itself — travels on every
+tool call once a household member has encryption on, and that shouldn't
+cross the wire in plaintext even though today Miranda and miranda-diary run
+on the same host and talk over loopback.
+
+A CA-issued certificate would be overkill for a link with no public DNS
+name that never leaves localhost, so `internal/tlscert.EnsureSelfSigned`
+generates and self-signs its own certificate the first time the server
+starts, writing it to `tls.cert_file` / `tls.key_file`
+(`data/tls/cert.pem` / `data/tls/key.pem` by default — under `data/`, so
+already covered by the existing gitignore and by `deploy.sh`'s
+`mkdir -p ~/miranda-diary/data`). On every start after that, both files
+already exist and are reused unchanged — regenerating them on restart would
+rotate the certificate out from under whatever trust store the client has
+pinned it in, breaking the connection until the new one is copied over by
+hand. `tls.hosts` (default `["127.0.0.1", "localhost"]`) sets the
+certificate's Subject Alternative Names; it isn't the diary's own bind
+address, so it stays correct even though `http_addr` itself has no host
+part (`:8789`).
+
+**Client side (miranda repo) is not wired up yet** — that's a separate
+change: `miranda/config/mcp.yaml`'s `diary` entry needs its `url` switched
+from `http://127.0.0.1:8789/mcp` to `https://127.0.0.1:8789/mcp`, and
+`internal/mcp.Connect` (in the miranda repo) needs to build an
+`http.Client` whose `tls.Config.RootCAs` trusts this self-signed
+certificate specifically (there's no CA chain to validate otherwise) —
+most simply by copying `data/tls/cert.pem`'s public half over and loading
+it into a cert pool. Until that lands, Miranda's existing plain-HTTP calls
+to the diary will fail once this deploys, since the listener no longer
+accepts plaintext connections at all.
 
 ### Request flow for `diary_search` (exposed as `search`)
 

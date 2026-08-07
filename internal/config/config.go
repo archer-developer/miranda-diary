@@ -43,6 +43,7 @@ type UserConfig struct {
 type Config struct {
 	HTTPAddr     string          `yaml:"http_addr"`
 	AuthTokenEnv string          `yaml:"auth_token_env"`
+	TLS          TLSConfig       `yaml:"tls"`
 	Database     DatabaseConfig  `yaml:"database"`
 	Embedding    EmbeddingConfig `yaml:"embedding"`
 	Search       SearchConfig    `yaml:"search"`
@@ -55,6 +56,27 @@ type Config struct {
 	// mcpserver.resolveUser.
 	Users   []UserConfig  `yaml:"users"`
 	Logging LoggingConfig `yaml:"logging"`
+}
+
+// TLSConfig controls whether the HTTP server listens with TLS. Miranda's
+// tool calls carry a per-user record_encryption_key once encryption is
+// enabled for that user (see UserConfig.Encryption), so the transport needs
+// to be encrypted even though both services currently run on the same host
+// over loopback. A full CA-issued certificate is unnecessary for a link that
+// never leaves localhost, so the server generates and trusts its own
+// self-signed certificate — see internal/tlscert.EnsureSelfSigned.
+type TLSConfig struct {
+	// Enabled turns on HTTPS. On by default: see Default().
+	Enabled bool `yaml:"enabled"`
+	// CertFile and KeyFile are where the self-signed certificate is
+	// generated on first start and reused on every start after that.
+	// Regenerating them on every restart would rotate the certificate out
+	// from under whatever trust store the client has pinned it in.
+	CertFile string `yaml:"cert_file"`
+	KeyFile  string `yaml:"key_file"`
+	// Hosts is the list of IP addresses and/or DNS names the generated
+	// certificate is valid for (its Subject Alternative Names).
+	Hosts []string `yaml:"hosts"`
 }
 
 // DatabaseConfig controls the SQLite database file location.
@@ -96,6 +118,12 @@ func Default() Config {
 	return Config{
 		HTTPAddr:     ":8789",
 		AuthTokenEnv: "DIARY_MCP_TOKEN",
+		TLS: TLSConfig{
+			Enabled:  true,
+			CertFile: "data/tls/cert.pem",
+			KeyFile:  "data/tls/key.pem",
+			Hosts:    []string{"127.0.0.1", "localhost"},
+		},
 		Database: DatabaseConfig{
 			Path: "data/diary.db",
 		},
@@ -172,6 +200,17 @@ func (c Config) validate() error {
 	}
 	if c.AuthTokenEnv == "" {
 		return fmt.Errorf("config: auth_token_env must not be empty")
+	}
+	if c.TLS.Enabled {
+		if c.TLS.CertFile == "" {
+			return fmt.Errorf("config: tls.cert_file must not be empty when tls.enabled is true")
+		}
+		if c.TLS.KeyFile == "" {
+			return fmt.Errorf("config: tls.key_file must not be empty when tls.enabled is true")
+		}
+		if len(c.TLS.Hosts) == 0 {
+			return fmt.Errorf("config: tls.hosts must not be empty when tls.enabled is true")
+		}
 	}
 	if c.Database.Path == "" {
 		return fmt.Errorf("config: database.path must not be empty")

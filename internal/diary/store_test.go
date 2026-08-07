@@ -81,13 +81,13 @@ func TestStore_UserIsolation(t *testing.T) {
 	require.NoError(t, err)
 
 	// Alice's search only returns Alice's record.
-	results, err := s.Search(ctx, userAlice, []float32{1, 0}, 10, nil)
+	results, _, err := s.Search(ctx, userAlice, []float32{1, 0}, 10, nil)
 	require.NoError(t, err)
 	require.Len(t, results, 1)
 	assert.Equal(t, "alice's secret", results[0].Content)
 
 	// Bob's search only returns Bob's record.
-	results, err = s.Search(ctx, userBob, []float32{1, 0}, 10, nil)
+	results, _, err = s.Search(ctx, userBob, []float32{1, 0}, 10, nil)
 	require.NoError(t, err)
 	require.Len(t, results, 1)
 	assert.Equal(t, "bob's entry", results[0].Content)
@@ -116,7 +116,7 @@ func TestStore_Search_RankedByScore(t *testing.T) {
 	require.NoError(t, err)
 
 	query := []float32{1, 0, 0}
-	results, err := s.Search(ctx, userAlice, query, 10, nil)
+	results, _, err := s.Search(ctx, userAlice, query, 10, nil)
 	require.NoError(t, err)
 	require.Len(t, results, 3)
 
@@ -135,7 +135,7 @@ func TestStore_Search_LimitRespected(t *testing.T) {
 		require.NoError(t, err)
 	}
 
-	results, err := s.Search(ctx, userAlice, []float32{1, 0}, 3, nil)
+	results, _, err := s.Search(ctx, userAlice, []float32{1, 0}, 3, nil)
 	require.NoError(t, err)
 	assert.Len(t, results, 3)
 }
@@ -162,7 +162,7 @@ func TestStore_Encryption(t *testing.T) {
 		// Add returns plaintext content — the caller passed it and doesn't need it back encrypted.
 		assert.Equal(t, "secret diary entry", rec.Content)
 
-		results, err := s.Search(ctx, userAlice, []float32{1, 0}, 10, key)
+		results, _, err := s.Search(ctx, userAlice, []float32{1, 0}, 10, key)
 		require.NoError(t, err)
 		require.Len(t, results, 1)
 		assert.Equal(t, "secret diary entry", results[0].Content)
@@ -175,7 +175,7 @@ func TestStore_Encryption(t *testing.T) {
 		require.NoError(t, err)
 
 		// verifyOrInitKeyCheck detects the mismatch before any row is scanned.
-		_, err = s.Search(ctx, userAlice, []float32{1, 0}, 10, wrongKey)
+		_, _, err = s.Search(ctx, userAlice, []float32{1, 0}, 10, wrongKey)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "wrong encryption key")
 	})
@@ -193,17 +193,19 @@ func TestStore_Encryption(t *testing.T) {
 		assert.Contains(t, err.Error(), "wrong encryption key")
 	})
 
-	t.Run("encrypted rows skipped silently when no key provided", func(t *testing.T) {
+	t.Run("encrypted rows skipped but counted when no key provided", func(t *testing.T) {
 		s := newTestStore(t)
 
 		_, err := s.Add(ctx, userAlice, "encrypted entry", nil, []float32{1, 0}, key)
 		require.NoError(t, err)
 
-		// Searching without a key: encrypted rows are silently skipped
-		// (migration scenario — encryption was on, then turned off in config).
-		results, err := s.Search(ctx, userAlice, []float32{1, 0}, 10, nil)
+		// Searching without a key: encrypted rows are skipped from results but
+		// counted (migration scenario — encryption was on, then turned off in
+		// config), so the caller can tell this apart from "no matches."
+		results, skipped, err := s.Search(ctx, userAlice, []float32{1, 0}, 10, nil)
 		require.NoError(t, err)
 		assert.Len(t, results, 0)
+		assert.Equal(t, 1, skipped)
 	})
 
 	t.Run("remove with wrong key returns error", func(t *testing.T) {
@@ -240,7 +242,7 @@ func TestStore_Encryption(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, "plaintext entry", rec.Content)
 
-		results, err := s.Search(ctx, userAlice, []float32{1, 0}, 10, nil)
+		results, _, err := s.Search(ctx, userAlice, []float32{1, 0}, 10, nil)
 		require.NoError(t, err)
 		require.Len(t, results, 1)
 		assert.Equal(t, "plaintext entry", results[0].Content)
@@ -260,7 +262,7 @@ func TestStore_Encryption(t *testing.T) {
 		require.NoError(t, err)
 
 		require.NotPanics(t, func() {
-			results, err := s.Search(ctx, userAlice, []float32{1, 0}, 10, key)
+			results, _, err := s.Search(ctx, userAlice, []float32{1, 0}, 10, key)
 			require.NoError(t, err)
 			assert.Len(t, results, 0)
 		})
