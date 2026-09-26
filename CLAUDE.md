@@ -94,13 +94,19 @@ accepts plaintext connections at all.
 
 1. `internal/httpserver.requireBearerToken` checks `Authorization: Bearer`
    against `auth_token_env`'s value — same constant-time comparison as sandbox.
-2. `mcpserver` validates `user_id` and `query` are non-empty, clamps `limit`.
+2. `mcpserver` validates `user_id` and `query` are non-empty, clamps `limit`,
+   and — if `from`/`to` were given — parses them via `parseLocalDateTime` in
+   that user's configured timezone and converts to a UTC `diary.TimeRange`
+   (see User timezones below).
 3. `embedding.GeminiEmbedder.Embed` calls the Gemini API to get a 768-dim
    float32 vector for the query text.
 4. `diary.Store.Search` runs `SELECT ... FROM records WHERE user_id = ?`,
-   loads all of that user's embeddings into memory, and ranks them by cosine
-   similarity computed in Go.
-5. Top `limit` results are returned sorted descending by score.
+   optionally narrowed by `AND created_at >= ?` / `AND created_at <= ?` when a
+   `TimeRange` was passed, loads the matching embeddings into memory, and
+   ranks them by cosine similarity computed in Go.
+5. Top `limit` results are returned sorted descending by score, with
+   `created_at` converted back to the user's local timezone before being
+   sent out.
 
 `add_record` is the same but writes: embed → INSERT.
 `remove` is `DELETE FROM records WHERE id = ? AND user_id = ?`.
@@ -142,6 +148,30 @@ no allowlist at all; it must be set explicitly in the server's own
 `[]string` specifically so per-user settings — the planned per-user
 biometric encryption key reference, for one — can be added as new struct
 fields later without another breaking rename of the config key.
+
+### User timezones
+
+Every stored record's `created_at` is UTC — always, no exceptions (see
+`diary.Store.Add`). But a household member saying "today" or "records from
+14 to 16" means their own local time, not UTC, and a time shown back to them
+as bare UTC is easy to misread as local. `config.UserConfig.Timezone`
+(an optional IANA name, e.g. `"Europe/Minsk"`) plus `config.UserLocations`
+close that gap — same pattern as miranda-medical-card's identically-named
+config field and helper, see that repo's `internal/config/config.go` and
+`internal/ask/providers.go`.
+
+`mcpserver.New` builds the `map[string]*time.Location` once via
+`config.UserLocations(cfg.Users)` and threads it into `addRecordHandler` and
+`searchHandler`. Two helpers do the conversion in both directions:
+`formatUserTime` renders a stored UTC `time.Time` in the user's zone as
+RFC3339 (so the trailing offset — e.g. `+03:00` — always says which
+timezone a returned time is in, never leaving the caller to guess or assume
+UTC); `parseLocalDateTime` does the reverse for `search`'s optional `from`/
+`to` fields, interpreting a caller-supplied `"YYYY-MM-DD"` or
+`"YYYY-MM-DD HH:MM[:SS]"` in that timezone and returning the equivalent UTC
+instant for `diary.TimeRange`. A user with no `timezone` configured falls
+back to UTC — `userLocation` never returns nil, so display and parsing are
+unconditional, not features gated on the field being set.
 
 ### Embedding storage
 

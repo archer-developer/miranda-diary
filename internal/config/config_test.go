@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -56,4 +57,38 @@ func TestLoad_MultipleFilesMergeInOrder(t *testing.T) {
 	assert.Equal(t, ":9999", cfg.HTTPAddr)
 	assert.Equal(t, []UserConfig{{ID: "archer"}}, cfg.Users)
 	assert.Equal(t, "debug", cfg.Logging.Level)
+}
+
+func TestLoad_InvalidTimezoneRejected(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	require.NoError(t, os.WriteFile(path, []byte("users:\n  - id: \"archer\"\n    timezone: \"Not/A_Zone\"\n"), 0o644))
+
+	_, err := Load(path)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "timezone")
+}
+
+func TestLoad_ValidTimezoneAccepted(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	require.NoError(t, os.WriteFile(path, []byte("users:\n  - id: \"archer\"\n    timezone: \"Europe/Minsk\"\n"), 0o644))
+
+	cfg, err := Load(path)
+	require.NoError(t, err)
+	assert.Equal(t, "Europe/Minsk", cfg.Users[0].Timezone)
+}
+
+func TestUserLocations(t *testing.T) {
+	users := []UserConfig{
+		{ID: "archer", Timezone: "Europe/Minsk"},
+		{ID: "anna"}, // no timezone set — absent from the map, caller falls back to UTC
+	}
+
+	locs := UserLocations(users)
+
+	require.Contains(t, locs, "archer")
+	minsk, err := time.LoadLocation("Europe/Minsk")
+	require.NoError(t, err)
+	assert.Equal(t, minsk, locs["archer"])
+
+	assert.NotContains(t, locs, "anna")
 }

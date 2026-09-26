@@ -53,6 +53,9 @@
 # users:
 #   - id: "alice"
 #     encryption: false  # set to true to require AES-256-GCM encryption for this user's records
+#     timezone: "Europe/Minsk"  # IANA name; used to interpret and display this user's diary
+#                                # times (e.g. "today", "14:00") in their local time instead of
+#                                # UTC. Empty defaults to UTC.
 #   - id: "bob"
 #     encryption: false
 

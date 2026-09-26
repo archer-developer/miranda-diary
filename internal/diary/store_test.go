@@ -3,6 +3,7 @@ package diary
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -81,13 +82,13 @@ func TestStore_UserIsolation(t *testing.T) {
 	require.NoError(t, err)
 
 	// Alice's search only returns Alice's record.
-	results, _, err := s.Search(ctx, userAlice, []float32{1, 0}, 10, nil)
+	results, _, err := s.Search(ctx, userAlice, []float32{1, 0}, 10, nil, nil)
 	require.NoError(t, err)
 	require.Len(t, results, 1)
 	assert.Equal(t, "alice's secret", results[0].Content)
 
 	// Bob's search only returns Bob's record.
-	results, _, err = s.Search(ctx, userBob, []float32{1, 0}, 10, nil)
+	results, _, err = s.Search(ctx, userBob, []float32{1, 0}, 10, nil, nil)
 	require.NoError(t, err)
 	require.Len(t, results, 1)
 	assert.Equal(t, "bob's entry", results[0].Content)
@@ -116,7 +117,7 @@ func TestStore_Search_RankedByScore(t *testing.T) {
 	require.NoError(t, err)
 
 	query := []float32{1, 0, 0}
-	results, _, err := s.Search(ctx, userAlice, query, 10, nil)
+	results, _, err := s.Search(ctx, userAlice, query, 10, nil, nil)
 	require.NoError(t, err)
 	require.Len(t, results, 3)
 
@@ -135,9 +136,56 @@ func TestStore_Search_LimitRespected(t *testing.T) {
 		require.NoError(t, err)
 	}
 
-	results, _, err := s.Search(ctx, userAlice, []float32{1, 0}, 3, nil)
+	results, _, err := s.Search(ctx, userAlice, []float32{1, 0}, 3, nil, nil)
 	require.NoError(t, err)
 	assert.Len(t, results, 3)
+}
+
+func TestStore_Search_TimeRange(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	base := time.Date(2026, 9, 26, 0, 0, 0, 0, time.UTC)
+	insertAt := func(id string, at time.Time) {
+		_, err := s.db.ExecContext(ctx,
+			`INSERT INTO records (id, user_id, content, tags, created_at, embedding) VALUES (?, ?, ?, ?, ?, ?)`,
+			id, userAlice, "entry "+id, "[]", at.Unix(), encodeEmbedding([]float32{1, 0}),
+		)
+		require.NoError(t, err)
+	}
+	insertAt("early", base.Add(10*time.Hour))
+	insertAt("mid", base.Add(14*time.Hour))
+	insertAt("late", base.Add(18*time.Hour))
+
+	t.Run("both bounds set", func(t *testing.T) {
+		from := base.Add(12 * time.Hour)
+		to := base.Add(16 * time.Hour)
+		results, _, err := s.Search(ctx, userAlice, []float32{1, 0}, 10, nil, &TimeRange{From: &from, To: &to})
+		require.NoError(t, err)
+		require.Len(t, results, 1)
+		assert.Equal(t, "entry mid", results[0].Content)
+	})
+
+	t.Run("from only", func(t *testing.T) {
+		from := base.Add(12 * time.Hour)
+		results, _, err := s.Search(ctx, userAlice, []float32{1, 0}, 10, nil, &TimeRange{From: &from})
+		require.NoError(t, err)
+		require.Len(t, results, 2)
+	})
+
+	t.Run("to only", func(t *testing.T) {
+		to := base.Add(12 * time.Hour)
+		results, _, err := s.Search(ctx, userAlice, []float32{1, 0}, 10, nil, &TimeRange{To: &to})
+		require.NoError(t, err)
+		require.Len(t, results, 1)
+		assert.Equal(t, "entry early", results[0].Content)
+	})
+
+	t.Run("nil TimeRange means unbounded", func(t *testing.T) {
+		results, _, err := s.Search(ctx, userAlice, []float32{1, 0}, 10, nil, nil)
+		require.NoError(t, err)
+		assert.Len(t, results, 3)
+	})
 }
 
 func TestStore_Encryption(t *testing.T) {
@@ -162,7 +210,7 @@ func TestStore_Encryption(t *testing.T) {
 		// Add returns plaintext content — the caller passed it and doesn't need it back encrypted.
 		assert.Equal(t, "secret diary entry", rec.Content)
 
-		results, _, err := s.Search(ctx, userAlice, []float32{1, 0}, 10, key)
+		results, _, err := s.Search(ctx, userAlice, []float32{1, 0}, 10, key, nil)
 		require.NoError(t, err)
 		require.Len(t, results, 1)
 		assert.Equal(t, "secret diary entry", results[0].Content)
@@ -175,7 +223,7 @@ func TestStore_Encryption(t *testing.T) {
 		require.NoError(t, err)
 
 		// verifyOrInitKeyCheck detects the mismatch before any row is scanned.
-		_, _, err = s.Search(ctx, userAlice, []float32{1, 0}, 10, wrongKey)
+		_, _, err = s.Search(ctx, userAlice, []float32{1, 0}, 10, wrongKey, nil)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "wrong encryption key")
 	})
@@ -202,7 +250,7 @@ func TestStore_Encryption(t *testing.T) {
 		// Searching without a key: encrypted rows are skipped from results but
 		// counted (migration scenario — encryption was on, then turned off in
 		// config), so the caller can tell this apart from "no matches."
-		results, skipped, err := s.Search(ctx, userAlice, []float32{1, 0}, 10, nil)
+		results, skipped, err := s.Search(ctx, userAlice, []float32{1, 0}, 10, nil, nil)
 		require.NoError(t, err)
 		assert.Len(t, results, 0)
 		assert.Equal(t, 1, skipped)
@@ -242,10 +290,51 @@ func TestStore_Encryption(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, "plaintext entry", rec.Content)
 
-		results, _, err := s.Search(ctx, userAlice, []float32{1, 0}, 10, nil)
+		results, _, err := s.Search(ctx, userAlice, []float32{1, 0}, 10, nil, nil)
 		require.NoError(t, err)
 		require.Len(t, results, 1)
 		assert.Equal(t, "plaintext entry", results[0].Content)
+	})
+
+	t.Run("tags are encrypted at rest and decrypted on search", func(t *testing.T) {
+		s := newTestStore(t)
+
+		rec, err := s.Add(ctx, userAlice, "secret entry", []string{"therapy", "argument"}, []float32{1, 0}, key)
+		require.NoError(t, err)
+		assert.Equal(t, []string{"therapy", "argument"}, rec.Tags)
+
+		// The tags column must not contain the plaintext tag values — only
+		// ciphertext bytes decryptable with the key.
+		var rawTags []byte
+		err = s.db.QueryRowContext(ctx, `SELECT tags FROM records WHERE id = ?`, rec.ID).Scan(&rawTags)
+		require.NoError(t, err)
+		assert.NotContains(t, string(rawTags), "therapy")
+		assert.NotContains(t, string(rawTags), "argument")
+
+		results, _, err := s.Search(ctx, userAlice, []float32{1, 0}, 10, key, nil)
+		require.NoError(t, err)
+		require.Len(t, results, 1)
+		assert.Equal(t, []string{"therapy", "argument"}, results[0].Tags)
+	})
+
+	t.Run("pre-existing encrypted row with plaintext tags and no tags_nonce still reads tags", func(t *testing.T) {
+		s := newTestStore(t)
+
+		// Simulates a row written before tag encryption existed: content is
+		// encrypted, tags is plaintext JSON, tags_nonce is NULL.
+		ciphertext, nonce, err := encryptContent(key, "old secret entry")
+		require.NoError(t, err)
+		_, err = s.db.ExecContext(ctx,
+			`INSERT INTO records (id, user_id, content, tags, created_at, embedding, content_nonce, content_encrypted) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+			"legacy-row", userAlice, ciphertext, `["old-tag"]`, 0, encodeEmbedding([]float32{1, 0}), nonce, 1,
+		)
+		require.NoError(t, err)
+
+		results, _, err := s.Search(ctx, userAlice, []float32{1, 0}, 10, key, nil)
+		require.NoError(t, err)
+		require.Len(t, results, 1)
+		assert.Equal(t, "old secret entry", results[0].Content)
+		assert.Equal(t, []string{"old-tag"}, results[0].Tags)
 	})
 
 	t.Run("row with nil content_nonce is skipped instead of panicking", func(t *testing.T) {
@@ -262,7 +351,7 @@ func TestStore_Encryption(t *testing.T) {
 		require.NoError(t, err)
 
 		require.NotPanics(t, func() {
-			results, _, err := s.Search(ctx, userAlice, []float32{1, 0}, 10, key)
+			results, _, err := s.Search(ctx, userAlice, []float32{1, 0}, 10, key, nil)
 			require.NoError(t, err)
 			assert.Len(t, results, 0)
 		})

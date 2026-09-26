@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -37,6 +38,13 @@ type UserConfig struct {
 	// only the sentinel. Embeddings are kept unencrypted so semantic search
 	// continues to work. See internal/diary/crypto.go.
 	Encryption bool `yaml:"encryption"`
+	// Timezone, if set, is an IANA timezone name (e.g. "Europe/Minsk",
+	// "Europe/Moscow", "UTC") used to interpret and display this user's diary
+	// times — see UserLocations. Empty defaults to UTC, which is unambiguous
+	// but doesn't match what the user means when they say "today" or a clock
+	// time like "14:00" (same pattern as miranda-medical-card's
+	// config.UserConfig.Timezone).
+	Timezone string `yaml:"timezone"`
 }
 
 // Config is the root of the service's configuration tree.
@@ -239,6 +247,31 @@ func (c Config) validate() error {
 			return fmt.Errorf("config: users[%d].id %q is a duplicate — entries must be unique", i, u.ID)
 		}
 		seen[u.ID] = true
+		if u.Timezone != "" {
+			if _, err := time.LoadLocation(u.Timezone); err != nil {
+				return fmt.Errorf("config: users[%d].timezone %q is not a valid IANA timezone name", i, u.Timezone)
+			}
+		}
 	}
 	return nil
+}
+
+// UserLocations builds a map of user ID → *time.Location from the configured
+// timezone strings. Users with no Timezone (or an unrecognised one, which
+// validate() would have already rejected at startup) are absent from the
+// map; callers fall back to time.UTC for absent entries. Same helper as
+// miranda-medical-card's config.UserLocations.
+func UserLocations(users []UserConfig) map[string]*time.Location {
+	locs := make(map[string]*time.Location, len(users))
+	for _, u := range users {
+		if u.Timezone == "" {
+			continue
+		}
+		loc, err := time.LoadLocation(u.Timezone)
+		if err != nil {
+			continue // validate() already rejects bad names at startup; skip defensively here
+		}
+		locs[u.ID] = loc
+	}
+	return locs
 }

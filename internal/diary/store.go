@@ -39,6 +39,11 @@ var schemaMigrations = []string{
 		check_nonce  BLOB NOT NULL,
 		check_cipher BLOB NOT NULL
 	)`,
+	// tags_nonce is nil for rows written before tag encryption was added, even
+	// if content_encrypted is 1 — those rows' tags column already holds
+	// plaintext JSON and stays readable as such. Search tells the two cases
+	// apart by checking tags_nonce's length, not just content_encrypted.
+	`ALTER TABLE records ADD COLUMN tags_nonce BLOB`,
 }
 
 // Store is a SQLite-backed diary store. Records are written with their
@@ -48,8 +53,10 @@ var schemaMigrations = []string{
 // (10 000 records × 768 dims × 4 bytes ≈ 30 MB RAM).
 //
 // When a non-nil encryptionKey is passed to Add/Search/Remove, record content
-// is protected with AES-256-GCM. Embeddings are always stored in plaintext so
-// semantic search continues to work regardless of encryption state.
+// and tags are protected with AES-256-GCM, each with its own nonce (tags are
+// never filtered on in SQL, so encrypting them costs nothing functionally).
+// Embeddings are always stored in plaintext so semantic search continues to
+// work regardless of encryption state.
 type Store struct {
 	db *sql.DB
 }
@@ -91,10 +98,11 @@ func New(path string) (*Store, error) {
 // Add stores a new diary record owned by userID and returns it. embedding must
 // be non-empty; tags may be nil (stored as an empty JSON array).
 //
-// When encryptionKey is non-nil, content is encrypted with AES-256-GCM before
-// storage. On first use for a given user, the key is validated and a sentinel
-// is stored; on subsequent calls the sentinel is used to detect wrong keys
-// before any record is written. Pass nil to store content in plaintext.
+// When encryptionKey is non-nil, content and tags are each encrypted with
+// AES-256-GCM (separate nonces) before storage. On first use for a given
+// user, the key is validated and a sentinel is stored; on subsequent calls
+// the sentinel is used to detect wrong keys before any record is written.
+// Pass nil to store content and tags in plaintext.
 func (s *Store) Add(ctx context.Context, userID, content string, tags []string, embedding []float32, encryptionKey []byte) (Record, error) {
 	if tags == nil {
 		tags = []string{}
@@ -112,13 +120,17 @@ func (s *Store) Add(ctx context.Context, userID, content string, tags []string, 
 		if err := verifyOrInitKeyCheck(ctx, s.db, userID, encryptionKey); err != nil {
 			return Record{}, err
 		}
-		ciphertext, nonce, err := encryptContent(encryptionKey, content)
+		contentCiphertext, contentNonce, err := encryptContent(encryptionKey, content)
 		if err != nil {
 			return Record{}, fmt.Errorf("diary: encrypt content: %w", err)
 		}
+		tagsCiphertext, tagsNonce, err := encryptContent(encryptionKey, string(tagsJSON))
+		if err != nil {
+			return Record{}, fmt.Errorf("diary: encrypt tags: %w", err)
+		}
 		_, err = s.db.ExecContext(ctx,
-			`INSERT INTO records (id, user_id, content, tags, created_at, embedding, content_nonce, content_encrypted) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-			id, userID, ciphertext, string(tagsJSON), now.Unix(), encodeEmbedding(embedding), nonce, 1,
+			`INSERT INTO records (id, user_id, content, tags, created_at, embedding, content_nonce, content_encrypted, tags_nonce) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			id, userID, contentCiphertext, tagsCiphertext, now.Unix(), encodeEmbedding(embedding), contentNonce, 1, tagsNonce,
 		)
 		if err != nil {
 			return Record{}, fmt.Errorf("diary: insert record: %w", err)
@@ -158,17 +170,35 @@ func (s *Store) VerifyEncryptionKey(ctx context.Context, userID string, encrypti
 // rather than returned (e.g. when encryption was enabled and then later
 // disabled for a user); skippedEncrypted counts how many, so the caller can
 // surface that to whoever asked instead of it looking like "no matches."
-func (s *Store) Search(ctx context.Context, userID string, queryEmbedding []float32, limit int, encryptionKey []byte) (results []SearchResult, skippedEncrypted int, err error) {
+//
+// timeRange, if non-nil, additionally bounds results to created_at values in
+// [From, To] (either bound may be nil). This is applied as a SQL WHERE clause
+// rather than an in-memory filter after scoring, since it's the cheaper place
+// to exclude rows — no point decrypting or embedding-scoring a record outside
+// the requested window. The caller (mcpserver) is responsible for converting
+// a user-facing local time range into the UTC bounds stored here; created_at
+// itself is always UTC, see Add.
+func (s *Store) Search(ctx context.Context, userID string, queryEmbedding []float32, limit int, encryptionKey []byte, timeRange *TimeRange) (results []SearchResult, skippedEncrypted int, err error) {
 	if encryptionKey != nil {
 		if err := verifyOrInitKeyCheck(ctx, s.db, userID, encryptionKey); err != nil {
 			return nil, 0, err
 		}
 	}
 
-	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, content, tags, created_at, embedding, content_nonce, content_encrypted FROM records WHERE user_id = ?`,
-		userID,
-	)
+	query := `SELECT id, content, tags, created_at, embedding, content_nonce, content_encrypted, tags_nonce FROM records WHERE user_id = ?`
+	args := []any{userID}
+	if timeRange != nil {
+		if timeRange.From != nil {
+			query += ` AND created_at >= ?`
+			args = append(args, timeRange.From.Unix())
+		}
+		if timeRange.To != nil {
+			query += ` AND created_at <= ?`
+			args = append(args, timeRange.To.Unix())
+		}
+	}
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, 0, fmt.Errorf("diary: query records: %w", err)
 	}
@@ -178,13 +208,14 @@ func (s *Store) Search(ctx context.Context, userID string, queryEmbedding []floa
 		var (
 			id               string
 			contentBytes     []byte
-			tagsJSON         string
+			tagsBytes        []byte
 			createdAt        int64
 			embBlob          []byte
 			contentNonce     []byte // nil for non-encrypted rows
 			contentEncrypted int
+			tagsNonce        []byte // nil for rows written before tag encryption existed
 		)
-		if err := rows.Scan(&id, &contentBytes, &tagsJSON, &createdAt, &embBlob, &contentNonce, &contentEncrypted); err != nil {
+		if err := rows.Scan(&id, &contentBytes, &tagsBytes, &createdAt, &embBlob, &contentNonce, &contentEncrypted, &tagsNonce); err != nil {
 			return nil, 0, fmt.Errorf("diary: scan row: %w", err)
 		}
 
@@ -219,8 +250,22 @@ func (s *Store) Search(ctx context.Context, userID string, queryEmbedding []floa
 			content = string(contentBytes)
 		}
 
+		// tags_nonce set means this row was written after tag encryption was
+		// added and tagsBytes is ciphertext; otherwise (including rows with
+		// content_encrypted=1 written before this change) tagsBytes is already
+		// plaintext JSON.
+		tagsJSON := tagsBytes
+		if len(tagsNonce) == gcmNonceSize {
+			tagsPlain, err := decryptContent(encryptionKey, tagsNonce, tagsBytes)
+			if err != nil {
+				// Should not happen after the key check above, but skip rather than crash.
+				continue
+			}
+			tagsJSON = []byte(tagsPlain)
+		}
+
 		var tags []string
-		if err := json.Unmarshal([]byte(tagsJSON), &tags); err != nil {
+		if err := json.Unmarshal(tagsJSON, &tags); err != nil {
 			tags = []string{}
 		}
 

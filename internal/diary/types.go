@@ -20,3 +20,13 @@ type SearchResult struct {
 	Record
 	Score float64
 }
+
+// TimeRange optionally bounds Store.Search results by created_at. Both
+// fields are nil-able independently — a caller with only a "from" or only a
+// "to" doesn't need to invent an unbounded sentinel value on the other side.
+// A nil *TimeRange (as opposed to a non-nil TimeRange with both fields nil)
+// means "no time filtering at all" — see Store.Search.
+type TimeRange struct {
+	From *time.Time
+	To   *time.Time
+}

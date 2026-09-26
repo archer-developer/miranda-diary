@@ -47,6 +47,13 @@ func New(store *diary.Store, embedder embedding.Embedder, cfg config.SearchConfi
 		userMap[u.ID] = u
 	}
 
+	// locations maps each configured user to their IANA timezone (config.UserLocations);
+	// absent entries fall back to UTC. Diary times are always stored in UTC (see
+	// diary.Store.Add) — this is what lets handlers translate a user's "today" or
+	// "14:00" into the right UTC instant, and translate stored UTC times back into
+	// what that user actually means by local time when returning results.
+	locations := config.UserLocations(configuredUsers)
+
 	server := mcp.NewServer(&mcp.Implementation{Name: serverName, Version: serverVersion}, nil)
 
 	mcp.AddTool(server, &mcp.Tool{
@@ -56,16 +63,19 @@ func New(store *diary.Store, embedder embedding.Embedder, cfg config.SearchConfi
 			"Use tags to group related entries (e.g. [\"work\", \"idea\"])." +
 			userHint +
 			" Returns the record ID and timestamp of the saved entry.",
-	}, addRecordHandler(store, embedder, users, userMap, logger))
+	}, addRecordHandler(store, embedder, users, userMap, locations, logger))
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name: "search",
 		Description: "Search the personal diary by meaning. " +
 			"Pass a natural-language query — the search finds semantically similar entries even when they use different words. " +
 			"Returns matching records ranked by relevance with their content, tags, date, and similarity score. " +
+			"Optionally pass from/to to also restrict results to a time window — interpret any time the caller mentions " +
+			"(\"today\", \"yesterday from 14 to 16\", a specific date) in that user's own local time, not UTC, and pass it " +
+			"through as-is (\"YYYY-MM-DD\" or \"YYYY-MM-DD HH:MM[:SS]\"); the server converts it using that user's configured timezone. " +
 			"Use limit to control how many results to return (default: " + fmt.Sprint(cfg.DefaultLimit) + ", max: " + fmt.Sprint(cfg.MaxLimit) + ")." +
 			userHint,
-	}, searchHandler(store, embedder, cfg, users, userMap, logger))
+	}, searchHandler(store, embedder, cfg, users, userMap, locations, logger))
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name: "remove",
@@ -91,6 +101,81 @@ func resolveUser(users []string, action, userID string) (string, error) {
 		return "", fmt.Errorf("%s: unknown user_id %q; configured users: %s", action, userID, strings.Join(users, ", "))
 	}
 	return userID, nil
+}
+
+// userLocation looks up userID's configured timezone in locations (built
+// once by New() via config.UserLocations), falling back to UTC for a user
+// with none configured. Never returns nil.
+func userLocation(locations map[string]*time.Location, userID string) *time.Location {
+	if loc, ok := locations[userID]; ok && loc != nil {
+		return loc
+	}
+	return time.UTC
+}
+
+// formatUserTime renders t (always stored/passed around internally as UTC —
+// see diary.Store.Add) in loc using RFC3339, so every timestamp this server
+// returns is both in the user's own local time and self-describing: RFC3339's
+// trailing numeric offset (e.g. "+03:00") means the reader — Miranda's LLM —
+// never has to guess which timezone a time is in or silently assume UTC.
+func formatUserTime(t time.Time, loc *time.Location) string {
+	return t.In(loc).Format(time.RFC3339)
+}
+
+// parseLocalDateTime parses raw as a date or date-time, interpreted in loc
+// (the searching user's own configured timezone — see userLocation), and
+// returns the equivalent UTC instant for comparison against created_at
+// (always stored in UTC). This is what lets a caller pass a time the way the
+// user actually said it ("2026-09-26 14:00" meaning 14:00 in Minsk, not UTC)
+// instead of having to pre-convert it themselves.
+//
+// A bare date with no time-of-day is ambiguous about which end of the day it
+// bounds, so endOfDay picks: false anchors it to that day's start (00:00:00),
+// true to its last instant (23:59:59.999999999) — the same rule
+// miranda-medical-card's timeline tool applies to its own to bound, so that
+// e.g. to: "2026-09-26" includes the entire day rather than excluding
+// everything after midnight.
+func parseLocalDateTime(raw string, loc *time.Location, endOfDay bool) (time.Time, error) {
+	const dateOnly = "2006-01-02"
+	layouts := []string{"2006-01-02 15:04:05", "2006-01-02T15:04:05", "2006-01-02 15:04", "2006-01-02T15:04", dateOnly}
+	for _, layout := range layouts {
+		t, err := time.ParseInLocation(layout, raw, loc)
+		if err != nil {
+			continue
+		}
+		if layout == dateOnly && endOfDay {
+			t = t.Add(24*time.Hour - time.Nanosecond)
+		}
+		return t.UTC(), nil
+	}
+	return time.Time{}, fmt.Errorf("must be \"YYYY-MM-DD\" or \"YYYY-MM-DD HH:MM[:SS]\", got %q", raw)
+}
+
+// resolveTimeRange builds a *diary.TimeRange from the caller-supplied from/to
+// strings (both optional, either or both may be empty), interpreted in loc.
+// Returns nil when both are empty — meaning "no time filtering," not a
+// TimeRange with both bounds nil, so Store.Search can skip the SQL clause
+// entirely in the common case of a plain semantic search.
+func resolveTimeRange(action, from, to string, loc *time.Location) (*diary.TimeRange, error) {
+	if from == "" && to == "" {
+		return nil, nil
+	}
+	tr := &diary.TimeRange{}
+	if from != "" {
+		t, err := parseLocalDateTime(from, loc, false)
+		if err != nil {
+			return nil, fmt.Errorf("%s: from %w", action, err)
+		}
+		tr.From = &t
+	}
+	if to != "" {
+		t, err := parseLocalDateTime(to, loc, true)
+		if err != nil {
+			return nil, fmt.Errorf("%s: to %w", action, err)
+		}
+		tr.To = &t
+	}
+	return tr, nil
 }
 
 // parseEncryptionKey decodes a hex-encoded 32-byte encryption key. Returns nil
@@ -142,11 +227,14 @@ type AddRecordInput struct {
 }
 
 type AddRecordOutput struct {
-	ID        string `json:"id"`
+	ID string `json:"id"`
+	// CreatedAt is in the user's own configured timezone (config.UserConfig.Timezone,
+	// UTC if unset), formatted as RFC3339 so its trailing offset always says which
+	// timezone that is — see formatUserTime.
 	CreatedAt string `json:"created_at"`
 }
 
-func addRecordHandler(store *diary.Store, embedder embedding.Embedder, users []string, userMap map[string]config.UserConfig, logger *slog.Logger) mcp.ToolHandlerFor[AddRecordInput, AddRecordOutput] {
+func addRecordHandler(store *diary.Store, embedder embedding.Embedder, users []string, userMap map[string]config.UserConfig, locations map[string]*time.Location, logger *slog.Logger) mcp.ToolHandlerFor[AddRecordInput, AddRecordOutput] {
 	return func(ctx context.Context, _ *mcp.CallToolRequest, in AddRecordInput) (*mcp.CallToolResult, AddRecordOutput, error) {
 		// Scrub before any other handler code touches in, so a future change
 		// that logs the input struct directly can never leak the raw key.
@@ -195,7 +283,7 @@ func addRecordHandler(store *diary.Store, embedder embedding.Embedder, users []s
 
 		out := AddRecordOutput{
 			ID:        rec.ID,
-			CreatedAt: rec.CreatedAt.Format(time.RFC3339),
+			CreatedAt: formatUserTime(rec.CreatedAt, userLocation(locations, userID)),
 		}
 		text := fmt.Sprintf("Saved. id: %s  created_at: %s", out.ID, out.CreatedAt)
 		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: text}}}, out, nil
@@ -205,8 +293,15 @@ func addRecordHandler(store *diary.Store, embedder embedding.Embedder, users []s
 // --- search ---
 
 type SearchInput struct {
-	UserID              string `json:"user_id" jsonschema:"The identifier of the user whose diary to search. Must be one of the configured users."`
-	Query               string `json:"query" jsonschema:"Natural-language search query. The search finds diary entries that are semantically similar to this text."`
+	UserID string `json:"user_id" jsonschema:"The identifier of the user whose diary to search. Must be one of the configured users."`
+	Query  string `json:"query" jsonschema:"Natural-language search query. The search finds diary entries that are semantically similar to this text."`
+	// From and To bound results by when they were recorded. Both are parsed in
+	// the searching user's own configured timezone (config.UserConfig.Timezone,
+	// UTC if unset) — see resolveTimeRange/parseLocalDateTime — so the caller
+	// should pass whatever local date/time the user actually meant ("today",
+	// "14:00") without converting it themselves.
+	From                string `json:"from,omitempty" jsonschema:"Start of the time window, in the user's own local time (not UTC): \"YYYY-MM-DD\" or \"YYYY-MM-DD HH:MM[:SS]\". Omit for no lower bound."`
+	To                  string `json:"to,omitempty" jsonschema:"End of the time window, in the user's own local time (not UTC): \"YYYY-MM-DD\" or \"YYYY-MM-DD HH:MM[:SS]\". A bare date includes that entire day. Omit for no upper bound."`
 	Limit               int    `json:"limit,omitempty" jsonschema:"Maximum number of results to return. Defaults to the server's configured default; clamped to the server's maximum."`
 	RecordEncryptionKey string `json:"record_encryption_key,omitempty" jsonschema:"AES-256 encryption key for this user's diary records, hex-encoded (64 lowercase hex characters = 32 bytes). Miranda provides this automatically from the user's authenticated session. Required when encryption is enabled for the user; ignored otherwise."`
 }
@@ -221,14 +316,17 @@ type SearchOutput struct {
 }
 
 type SearchResultItem struct {
-	ID        string   `json:"id"`
-	Content   string   `json:"content"`
-	Tags      []string `json:"tags"`
-	CreatedAt string   `json:"created_at"`
-	Score     float64  `json:"score"`
+	ID      string   `json:"id"`
+	Content string   `json:"content"`
+	Tags    []string `json:"tags"`
+	// CreatedAt is in the user's own configured timezone (config.UserConfig.Timezone,
+	// UTC if unset), formatted as RFC3339 so its trailing offset always says which
+	// timezone that is — see formatUserTime.
+	CreatedAt string  `json:"created_at"`
+	Score     float64 `json:"score"`
 }
 
-func searchHandler(store *diary.Store, embedder embedding.Embedder, cfg config.SearchConfig, users []string, userMap map[string]config.UserConfig, logger *slog.Logger) mcp.ToolHandlerFor[SearchInput, SearchOutput] {
+func searchHandler(store *diary.Store, embedder embedding.Embedder, cfg config.SearchConfig, users []string, userMap map[string]config.UserConfig, locations map[string]*time.Location, logger *slog.Logger) mcp.ToolHandlerFor[SearchInput, SearchOutput] {
 	return func(ctx context.Context, _ *mcp.CallToolRequest, in SearchInput) (*mcp.CallToolResult, SearchOutput, error) {
 		rawKey := in.RecordEncryptionKey
 		in.RecordEncryptionKey = ""
@@ -253,6 +351,12 @@ func searchHandler(store *diary.Store, embedder embedding.Embedder, cfg config.S
 			}
 		}
 
+		loc := userLocation(locations, userID)
+		timeRange, err := resolveTimeRange("search", in.From, in.To, loc)
+		if err != nil {
+			return nil, SearchOutput{}, err
+		}
+
 		limit := in.Limit
 		if limit <= 0 {
 			limit = cfg.DefaultLimit
@@ -266,7 +370,7 @@ func searchHandler(store *diary.Store, embedder embedding.Embedder, cfg config.S
 			return nil, SearchOutput{}, fmt.Errorf("search: generate query embedding: %w", err)
 		}
 
-		results, skipped, err := store.Search(ctx, userID, emb, limit, keyBytes)
+		results, skipped, err := store.Search(ctx, userID, emb, limit, keyBytes, timeRange)
 		if err != nil {
 			return nil, SearchOutput{}, fmt.Errorf("search: store: %w", err)
 		}
@@ -285,7 +389,7 @@ func searchHandler(store *diary.Store, embedder embedding.Embedder, cfg config.S
 				ID:        r.ID,
 				Content:   r.Content,
 				Tags:      r.Tags,
-				CreatedAt: r.CreatedAt.Format(time.RFC3339),
+				CreatedAt: formatUserTime(r.CreatedAt, loc),
 				Score:     r.Score,
 			}
 		}
