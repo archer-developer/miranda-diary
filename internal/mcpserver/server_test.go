@@ -73,6 +73,13 @@ func TestMCPServer_UnknownUserRejected(t *testing.T) {
 		assert.Contains(t, err.Error(), "unknown user_id")
 	})
 
+	t.Run("update_record", func(t *testing.T) {
+		h := updateRecordHandler(store, fakeEmbedder{}, testUsers, testUserMap, nil, logger)
+		_, _, err := h(ctx, req, UpdateRecordInput{UserID: "alexander", ID: "some-id", Content: "more"})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "unknown user_id")
+	})
+
 	t.Run("empty user_id", func(t *testing.T) {
 		h := addRecordHandler(store, fakeEmbedder{}, testUsers, testUserMap, nil, logger)
 		_, _, err := h(ctx, req, AddRecordInput{UserID: "  ", Content: "hello"})
@@ -294,5 +301,66 @@ func TestMCPServer_SearchTimeRangeUsesUserTimezone(t *testing.T) {
 		_, out, err := searchH(ctx, &mcp.CallToolRequest{}, SearchInput{UserID: "archer", Query: "entry", From: from, To: to})
 		require.NoError(t, err)
 		assert.Len(t, out.Results, 0)
+	})
+}
+
+// TestMCPServer_UpdateRecord covers the chronology use case update_record
+// exists for: appending to one record over time instead of remove + re-add.
+func TestMCPServer_UpdateRecord(t *testing.T) {
+	logger := slog.New(slog.DiscardHandler)
+	ctx := context.Background()
+	req := &mcp.CallToolRequest{}
+
+	setup := func(t *testing.T) (mcp.ToolHandlerFor[UpdateRecordInput, UpdateRecordOutput], string) {
+		store := newTestStore(t)
+		addH := addRecordHandler(store, fakeEmbedder{}, testUsers, testUserMap, nil, logger)
+		_, added, err := addH(ctx, req, AddRecordInput{UserID: "archer", Content: "12.11: started", Tags: []string{"repair"}})
+		require.NoError(t, err)
+		return updateRecordHandler(store, fakeEmbedder{}, testUsers, testUserMap, nil, logger), added.ID
+	}
+
+	t.Run("append is the default and keeps tags", func(t *testing.T) {
+		h, id := setup(t)
+		_, out, err := h(ctx, req, UpdateRecordInput{UserID: "archer", ID: id, Content: "13.11: continued"})
+		require.NoError(t, err)
+		assert.True(t, out.Updated)
+		assert.Equal(t, "12.11: started\n\n13.11: continued", out.Content)
+		assert.Equal(t, []string{"repair"}, out.Tags)
+		assert.NotEmpty(t, out.UpdatedAt)
+	})
+
+	t.Run("replace overwrites content and tags", func(t *testing.T) {
+		h, id := setup(t)
+		_, out, err := h(ctx, req, UpdateRecordInput{UserID: "archer", ID: id, Content: "rewritten", Mode: "replace", Tags: []string{"done"}})
+		require.NoError(t, err)
+		assert.Equal(t, "rewritten", out.Content)
+		assert.Equal(t, []string{"done"}, out.Tags)
+	})
+
+	t.Run("explicit empty tags clear them", func(t *testing.T) {
+		h, id := setup(t)
+		_, out, err := h(ctx, req, UpdateRecordInput{UserID: "archer", ID: id, Content: "more", Tags: []string{}})
+		require.NoError(t, err)
+		assert.Empty(t, out.Tags)
+	})
+
+	t.Run("another user's record is not found", func(t *testing.T) {
+		h, id := setup(t)
+		_, out, err := h(ctx, req, UpdateRecordInput{UserID: "anna", ID: id, Content: "hijack"})
+		require.NoError(t, err)
+		assert.False(t, out.Updated)
+	})
+
+	t.Run("invalid mode rejected", func(t *testing.T) {
+		h, id := setup(t)
+		_, _, err := h(ctx, req, UpdateRecordInput{UserID: "archer", ID: id, Content: "x", Mode: "prepend"})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "mode must be")
+	})
+
+	t.Run("empty content rejected", func(t *testing.T) {
+		h, id := setup(t)
+		_, _, err := h(ctx, req, UpdateRecordInput{UserID: "archer", ID: id, Content: "  "})
+		require.Error(t, err)
 	})
 }

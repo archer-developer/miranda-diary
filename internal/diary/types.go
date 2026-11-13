@@ -10,6 +10,9 @@ type Record struct {
 	Content   string
 	Tags      []string
 	CreatedAt time.Time
+	// UpdatedAt is when the record was last changed via Store.Update; the
+	// zero value means it has never been edited since it was added.
+	UpdatedAt time.Time
 }
 
 // SearchResult pairs a Record with its cosine similarity score against a

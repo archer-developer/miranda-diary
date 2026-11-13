@@ -104,6 +104,71 @@ func TestStore_UserIsolation(t *testing.T) {
 	assert.Equal(t, int64(1), n)
 }
 
+func TestStore_GetAndUpdate(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	rec, err := s.Add(ctx, userAlice, "day 1: started", []string{"trip"}, []float32{1, 0}, nil)
+	require.NoError(t, err)
+
+	got, found, err := s.Get(ctx, userAlice, rec.ID, nil)
+	require.NoError(t, err)
+	require.True(t, found)
+	assert.Equal(t, "day 1: started", got.Content)
+	assert.Equal(t, []string{"trip"}, got.Tags)
+	assert.True(t, got.UpdatedAt.IsZero(), "never-edited record has no updated_at")
+
+	updated, found, err := s.Update(ctx, userAlice, rec.ID, "day 1: started\n\nday 2: continued", []string{"trip", "log"}, []float32{0, 1}, nil)
+	require.NoError(t, err)
+	require.True(t, found)
+	assert.Equal(t, rec.CreatedAt.Unix(), updated.CreatedAt.Unix(), "created_at is preserved")
+	assert.False(t, updated.UpdatedAt.IsZero())
+
+	// The edit is visible through both Get and Search, including the new embedding.
+	got, _, err = s.Get(ctx, userAlice, rec.ID, nil)
+	require.NoError(t, err)
+	assert.Equal(t, "day 1: started\n\nday 2: continued", got.Content)
+	assert.Equal(t, []string{"trip", "log"}, got.Tags)
+	assert.Equal(t, updated.UpdatedAt, got.UpdatedAt)
+
+	results, _, err := s.Search(ctx, userAlice, []float32{0, 1}, 10, nil, nil)
+	require.NoError(t, err)
+	require.Len(t, results, 1)
+	assert.InDelta(t, 1.0, results[0].Score, 1e-6)
+	assert.False(t, results[0].UpdatedAt.IsZero())
+
+	n, err := s.Count(ctx, userAlice)
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), n, "update must not create a new record")
+}
+
+// TestStore_GetAndUpdate_UserIsolation mirrors TestStore_UserIsolation for
+// the edit path: another user's record is indistinguishable from a missing
+// one, and can't be overwritten.
+func TestStore_GetAndUpdate_UserIsolation(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	aliceRec, err := s.Add(ctx, userAlice, "alice's secret", nil, []float32{1, 0}, nil)
+	require.NoError(t, err)
+
+	_, found, err := s.Get(ctx, userBob, aliceRec.ID, nil)
+	require.NoError(t, err)
+	assert.False(t, found)
+
+	_, found, err = s.Update(ctx, userBob, aliceRec.ID, "hijacked", nil, []float32{1, 0}, nil)
+	require.NoError(t, err)
+	assert.False(t, found)
+
+	got, _, err := s.Get(ctx, userAlice, aliceRec.ID, nil)
+	require.NoError(t, err)
+	assert.Equal(t, "alice's secret", got.Content)
+
+	_, found, err = s.Update(ctx, userAlice, "no-such-id", "x", nil, []float32{1, 0}, nil)
+	require.NoError(t, err)
+	assert.False(t, found)
+}
+
 func TestStore_Search_RankedByScore(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
@@ -281,6 +346,55 @@ func TestStore_Encryption(t *testing.T) {
 		deleted, err := s.Remove(ctx, userAlice, rec.ID, key)
 		require.NoError(t, err)
 		assert.True(t, deleted)
+	})
+
+	t.Run("get and update round-trip encrypted content and tags", func(t *testing.T) {
+		s := newTestStore(t)
+
+		rec, err := s.Add(ctx, userAlice, "secret v1", []string{"private"}, []float32{1, 0}, key)
+		require.NoError(t, err)
+
+		_, found, err := s.Update(ctx, userAlice, rec.ID, "secret v2", []string{"private", "edited"}, []float32{1, 0}, key)
+		require.NoError(t, err)
+		require.True(t, found)
+
+		// Stored at rest as ciphertext, not plaintext.
+		var rawContent, rawTags []byte
+		require.NoError(t, s.db.QueryRowContext(ctx, `SELECT content, tags FROM records WHERE id = ?`, rec.ID).Scan(&rawContent, &rawTags))
+		assert.NotContains(t, string(rawContent), "secret v2")
+		assert.NotContains(t, string(rawTags), "edited")
+
+		got, found, err := s.Get(ctx, userAlice, rec.ID, key)
+		require.NoError(t, err)
+		require.True(t, found)
+		assert.Equal(t, "secret v2", got.Content)
+		assert.Equal(t, []string{"private", "edited"}, got.Tags)
+	})
+
+	t.Run("get and update with wrong key return error", func(t *testing.T) {
+		s := newTestStore(t)
+
+		rec, err := s.Add(ctx, userAlice, "secret", nil, []float32{1, 0}, key)
+		require.NoError(t, err)
+
+		_, _, err = s.Get(ctx, userAlice, rec.ID, wrongKey)
+		require.Error(t, err)
+		_, _, err = s.Update(ctx, userAlice, rec.ID, "overwrite", nil, []float32{1, 0}, wrongKey)
+		require.Error(t, err)
+
+		got, _, err := s.Get(ctx, userAlice, rec.ID, key)
+		require.NoError(t, err)
+		assert.Equal(t, "secret", got.Content)
+	})
+
+	t.Run("get of encrypted record without key returns ErrEncryptedNoKey", func(t *testing.T) {
+		s := newTestStore(t)
+
+		rec, err := s.Add(ctx, userAlice, "secret", nil, []float32{1, 0}, key)
+		require.NoError(t, err)
+
+		_, _, err = s.Get(ctx, userAlice, rec.ID, nil)
+		require.ErrorIs(t, err, ErrEncryptedNoKey)
 	})
 
 	t.Run("unencrypted records still searchable without key", func(t *testing.T) {

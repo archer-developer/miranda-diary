@@ -110,10 +110,20 @@ accepts plaintext connections at all.
 
 `add_record` is the same but writes: embed → INSERT.
 `remove` is `DELETE FROM records WHERE id = ? AND user_id = ?`.
+`update_record` is `Store.Get` → (append: existing text + `"\n\n"` + new
+text; replace: new text) → embed the *whole* result → `Store.Update`
+(`UPDATE ... WHERE id = ? AND user_id = ? RETURNING created_at`). It keeps
+`created_at` and sets `updated_at` (nullable column, NULL = never edited),
+re-encrypts in the user's *current* encryption mode, and treats another
+user's record as not found, same as `remove`. `mode` defaults to `append`
+because it's the non-destructive choice. Get→Update isn't one transaction
+(that would hold the single SQLite connection across the Gemini call), so two
+concurrent appends to one record can lose one — accepted for a one-caller
+diary.
 
 ### User isolation
 
-Every record has a `user_id TEXT NOT NULL` column. All three tool handlers
+Every record has a `user_id TEXT NOT NULL` column. All four tool handlers
 receive `user_id` as an explicit parameter from the MCP caller (Miranda), and
 every SQL query filters by it. `remove` uses `AND user_id = ?` so a
 caller can't delete another user's record even with a known ID — it just gets

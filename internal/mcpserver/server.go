@@ -1,5 +1,6 @@
-// Package mcpserver registers the three diary MCP tools — add_record,
-// search, remove — and wires them to the diary store and embedder.
+// Package mcpserver registers the four diary MCP tools — add_record,
+// update_record, search, remove — and wires them to the diary store and
+// embedder.
 package mcpserver
 
 import (
@@ -23,7 +24,7 @@ const (
 	serverVersion = "0.1.0"
 )
 
-// New builds and returns the MCP server with all three diary tools registered.
+// New builds and returns the MCP server with all four diary tools registered.
 // configuredUsers is the closed set of allowed household members
 // (config.Config.Users) — every handler rejects a call whose user_id isn't
 // one of their IDs, see resolveUser. A nil logger falls back to
@@ -64,6 +65,19 @@ func New(store *diary.Store, embedder embedding.Embedder, cfg config.SearchConfi
 			userHint +
 			" Returns the record ID and timestamp of the saved entry.",
 	}, addRecordHandler(store, embedder, users, userMap, locations, logger))
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name: "update_record",
+		Description: "Edit an existing diary record by its ID (returned by add_record and shown in search results). " +
+			"Use this instead of removing and re-adding a record — e.g. to keep a running chronology of an ongoing story in one entry. " +
+			"mode \"append\" (the default) adds content to the end of the existing text, separated by a blank line — " +
+			"you only send the new part, so prefix it with the date/time it refers to when keeping a chronology. " +
+			"mode \"replace\" overwrites the whole text with content — send the complete new text, anything left out is lost. " +
+			"Pass tags to replace the record's tags; omit tags to keep the existing ones. " +
+			"The record keeps its original created_at; updated_at records when it was last edited." +
+			userHint +
+			" Returns the record's full updated content.",
+	}, updateRecordHandler(store, embedder, users, userMap, locations, logger))
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name: "search",
@@ -290,6 +304,134 @@ func addRecordHandler(store *diary.Store, embedder embedding.Embedder, users []s
 	}
 }
 
+// --- update_record ---
+
+const (
+	updateModeAppend  = "append"
+	updateModeReplace = "replace"
+)
+
+// appendSeparator goes between a record's existing text and an appended
+// chunk, so successive entries in a running chronology read as paragraphs.
+const appendSeparator = "\n\n"
+
+type UpdateRecordInput struct {
+	UserID  string `json:"user_id" jsonschema:"The identifier of the user who owns the record. Must be one of the configured users."`
+	ID      string `json:"id" jsonschema:"The ID of the diary record to edit, as returned by add_record or search."`
+	Content string `json:"content" jsonschema:"In append mode: the new text to add to the end of the record. In replace mode: the complete new text of the record."`
+	Mode    string `json:"mode,omitempty" jsonschema:"\"append\" (default) adds content to the end of the existing text; \"replace\" overwrites the whole text."`
+	// Tags distinguishes "omitted" from "empty": JSON-omitted decodes to nil
+	// (keep existing tags), while an explicit [] decodes to an empty non-nil
+	// slice (clear all tags). The handler relies on that distinction.
+	Tags                []string `json:"tags,omitempty" jsonschema:"Optional new list of tags, replacing the existing ones. Omit to keep the current tags; pass an empty list to clear them."`
+	RecordEncryptionKey string   `json:"record_encryption_key,omitempty" jsonschema:"AES-256 encryption key for this user's diary records, hex-encoded (64 lowercase hex characters = 32 bytes). Miranda provides this automatically from the user's authenticated session. Required when encryption is enabled for the user; ignored otherwise."`
+}
+
+type UpdateRecordOutput struct {
+	Updated bool     `json:"updated"`
+	ID      string   `json:"id"`
+	Content string   `json:"content,omitempty"`
+	Tags    []string `json:"tags,omitempty"`
+	// CreatedAt/UpdatedAt are in the user's own configured timezone, RFC3339 —
+	// see formatUserTime.
+	CreatedAt string `json:"created_at,omitempty"`
+	UpdatedAt string `json:"updated_at,omitempty"`
+}
+
+func updateRecordHandler(store *diary.Store, embedder embedding.Embedder, users []string, userMap map[string]config.UserConfig, locations map[string]*time.Location, logger *slog.Logger) mcp.ToolHandlerFor[UpdateRecordInput, UpdateRecordOutput] {
+	return func(ctx context.Context, _ *mcp.CallToolRequest, in UpdateRecordInput) (*mcp.CallToolResult, UpdateRecordOutput, error) {
+		rawKey := in.RecordEncryptionKey
+		in.RecordEncryptionKey = ""
+
+		userID, err := resolveUser(users, "update_record", in.UserID)
+		if err != nil {
+			return nil, UpdateRecordOutput{}, err
+		}
+		if strings.TrimSpace(in.ID) == "" {
+			return nil, UpdateRecordOutput{}, fmt.Errorf("update_record: id must not be empty")
+		}
+		if strings.TrimSpace(in.Content) == "" {
+			return nil, UpdateRecordOutput{}, fmt.Errorf("update_record: content must not be empty")
+		}
+		mode := strings.ToLower(strings.TrimSpace(in.Mode))
+		if mode == "" {
+			// Append is the default because it's the non-destructive choice:
+			// a caller that meant "replace" but forgot to say so gets
+			// duplicated text, not silently lost text.
+			mode = updateModeAppend
+		}
+		if mode != updateModeAppend && mode != updateModeReplace {
+			return nil, UpdateRecordOutput{}, fmt.Errorf("update_record: mode must be %q or %q, got %q", updateModeAppend, updateModeReplace, in.Mode)
+		}
+
+		user := userMap[userID]
+		keyBytes, err := resolveEncryptionKey("update_record", user, rawKey)
+		if err != nil {
+			return nil, UpdateRecordOutput{}, err
+		}
+
+		// Read the current record first, even in replace mode: it confirms the
+		// record exists (and belongs to userID) before spending a Gemini call,
+		// and supplies the existing tags when the caller didn't pass new ones.
+		// Get also validates keyBytes, so a wrong key fails fast here.
+		existing, found, err := store.Get(ctx, userID, in.ID, keyBytes)
+		if err != nil {
+			return nil, UpdateRecordOutput{}, fmt.Errorf("update_record: %w", err)
+		}
+		if !found {
+			text := fmt.Sprintf("No record found with id %s.", in.ID)
+			return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: text}}}, UpdateRecordOutput{ID: in.ID}, nil
+		}
+
+		content := in.Content
+		if mode == updateModeAppend {
+			content = strings.TrimRight(existing.Content, "\n") + appendSeparator + strings.TrimLeft(in.Content, "\n")
+		}
+		tags := in.Tags
+		if tags == nil {
+			tags = existing.Tags
+		}
+
+		// Re-embed the whole resulting text, not just the appended part, so
+		// search keeps matching the record as a whole.
+		emb, err := embedder.Embed(ctx, content)
+		if err != nil {
+			return nil, UpdateRecordOutput{}, fmt.Errorf("update_record: generate embedding: %w", err)
+		}
+
+		rec, found, err := store.Update(ctx, userID, in.ID, content, tags, emb, keyBytes)
+		if err != nil {
+			return nil, UpdateRecordOutput{}, fmt.Errorf("update_record: store record: %w", err)
+		}
+		if !found {
+			// Removed between Get and Update.
+			text := fmt.Sprintf("No record found with id %s.", in.ID)
+			return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: text}}}, UpdateRecordOutput{ID: in.ID}, nil
+		}
+
+		logger.Info("update_record",
+			"user_id", userID,
+			"id", rec.ID,
+			"mode", mode,
+			"content_bytes", len(content),
+			"tags", tags,
+			"encrypted", user.Encryption,
+		)
+
+		loc := userLocation(locations, userID)
+		out := UpdateRecordOutput{
+			Updated:   true,
+			ID:        rec.ID,
+			Content:   rec.Content,
+			Tags:      rec.Tags,
+			CreatedAt: formatUserTime(rec.CreatedAt, loc),
+			UpdatedAt: formatUserTime(rec.UpdatedAt, loc),
+		}
+		text := fmt.Sprintf("Updated (%s). id: %s  created_at: %s  updated_at: %s\n\n%s", mode, out.ID, out.CreatedAt, out.UpdatedAt, out.Content)
+		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: text}}}, out, nil
+	}
+}
+
 // --- search ---
 
 type SearchInput struct {
@@ -322,7 +464,10 @@ type SearchResultItem struct {
 	// CreatedAt is in the user's own configured timezone (config.UserConfig.Timezone,
 	// UTC if unset), formatted as RFC3339 so its trailing offset always says which
 	// timezone that is — see formatUserTime.
-	CreatedAt string  `json:"created_at"`
+	CreatedAt string `json:"created_at"`
+	// UpdatedAt is set only for records edited via update_record, same
+	// timezone/format as CreatedAt.
+	UpdatedAt string  `json:"updated_at,omitempty"`
 	Score     float64 `json:"score"`
 }
 
@@ -392,6 +537,9 @@ func searchHandler(store *diary.Store, embedder embedding.Embedder, cfg config.S
 				CreatedAt: formatUserTime(r.CreatedAt, loc),
 				Score:     r.Score,
 			}
+			if !r.UpdatedAt.IsZero() {
+				items[i].UpdatedAt = formatUserTime(r.UpdatedAt, loc)
+			}
 		}
 
 		out := SearchOutput{Results: items, Total: len(items), SkippedEncrypted: skipped}
@@ -406,7 +554,11 @@ func formatSearchResults(items []SearchResultItem, skippedEncrypted int) string 
 	} else {
 		fmt.Fprintf(&b, "Found %d result(s):\n", len(items))
 		for i, item := range items {
-			fmt.Fprintf(&b, "\n--- #%d (id: %s, score: %.3f, date: %s) ---\n", i+1, item.ID, item.Score, item.CreatedAt)
+			if item.UpdatedAt != "" {
+				fmt.Fprintf(&b, "\n--- #%d (id: %s, score: %.3f, date: %s, updated: %s) ---\n", i+1, item.ID, item.Score, item.CreatedAt, item.UpdatedAt)
+			} else {
+				fmt.Fprintf(&b, "\n--- #%d (id: %s, score: %.3f, date: %s) ---\n", i+1, item.ID, item.Score, item.CreatedAt)
+			}
 			if len(item.Tags) > 0 {
 				fmt.Fprintf(&b, "Tags: [%s]\n", strings.Join(item.Tags, ", "))
 			}

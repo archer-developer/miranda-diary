@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"sort"
@@ -44,7 +45,17 @@ var schemaMigrations = []string{
 	// plaintext JSON and stays readable as such. Search tells the two cases
 	// apart by checking tags_nonce's length, not just content_encrypted.
 	`ALTER TABLE records ADD COLUMN tags_nonce BLOB`,
+	// updated_at is NULL for records that were never edited via Update.
+	// created_at is deliberately left untouched by Update, so a record that
+	// is appended to over weeks keeps sorting and time-filtering by when it
+	// was started; updated_at is what says when it last changed.
+	`ALTER TABLE records ADD COLUMN updated_at INTEGER`,
 }
+
+// ErrEncryptedNoKey is returned by Get (and used internally by Search) when
+// a record is stored encrypted but no encryption key was supplied — e.g.
+// encryption was enabled for a user and later disabled in config.
+var ErrEncryptedNoKey = errors.New("diary: record is encrypted and no encryption key was supplied")
 
 // Store is a SQLite-backed diary store. Records are written with their
 // float32 embedding (from Gemini) stored as a raw binary BLOB. Semantic
@@ -52,7 +63,7 @@ var schemaMigrations = []string{
 // perfectly adequate for a personal diary even at tens of thousands of entries
 // (10 000 records × 768 dims × 4 bytes ≈ 30 MB RAM).
 //
-// When a non-nil encryptionKey is passed to Add/Search/Remove, record content
+// When a non-nil encryptionKey is passed to Add/Update/Search, record content
 // and tags are protected with AES-256-GCM, each with its own nonce (tags are
 // never filtered on in SQL, so encrypting them costs nothing functionally).
 // Embeddings are always stored in plaintext so semantic search continues to
@@ -185,7 +196,7 @@ func (s *Store) Search(ctx context.Context, userID string, queryEmbedding []floa
 		}
 	}
 
-	query := `SELECT id, content, tags, created_at, embedding, content_nonce, content_encrypted, tags_nonce FROM records WHERE user_id = ?`
+	query := `SELECT id, content, tags, created_at, updated_at, embedding, content_nonce, content_encrypted, tags_nonce FROM records WHERE user_id = ?`
 	args := []any{userID}
 	if timeRange != nil {
 		if timeRange.From != nil {
@@ -206,16 +217,10 @@ func (s *Store) Search(ctx context.Context, userID string, queryEmbedding []floa
 
 	for rows.Next() {
 		var (
-			id               string
-			contentBytes     []byte
-			tagsBytes        []byte
-			createdAt        int64
-			embBlob          []byte
-			contentNonce     []byte // nil for non-encrypted rows
-			contentEncrypted int
-			tagsNonce        []byte // nil for rows written before tag encryption existed
+			r       storedRow
+			embBlob []byte
 		)
-		if err := rows.Scan(&id, &contentBytes, &tagsBytes, &createdAt, &embBlob, &contentNonce, &contentEncrypted, &tagsNonce); err != nil {
+		if err := rows.Scan(&r.id, &r.content, &r.tags, &r.createdAt, &r.updatedAt, &embBlob, &r.contentNonce, &r.contentEncrypted, &r.tagsNonce); err != nil {
 			return nil, 0, fmt.Errorf("diary: scan row: %w", err)
 		}
 
@@ -225,59 +230,23 @@ func (s *Store) Search(ctx context.Context, userID string, queryEmbedding []floa
 			continue
 		}
 
-		var content string
-		if contentEncrypted == 1 {
-			if encryptionKey == nil {
-				// Encrypted row with no key — encryption was on, then disabled.
-				// Skip it, but count it so the caller can tell the difference
-				// from "no matches" instead of it looking like data loss.
-				skippedEncrypted++
-				continue
-			}
-			if len(contentNonce) != gcmNonceSize {
-				// content_nonce has no NOT NULL constraint, so a corrupt or
-				// out-of-band-written row can carry a nil or wrong-length nonce.
-				// gcm.Open panics (rather than erroring) on a wrong-length nonce,
-				// so this must be checked before calling decryptContent.
-				continue
-			}
-			content, err = decryptContent(encryptionKey, contentNonce, contentBytes)
-			if err != nil {
-				// Should not happen after the key check above, but skip rather than crash.
-				continue
-			}
-		} else {
-			content = string(contentBytes)
+		rec, err := r.decode(encryptionKey)
+		if errors.Is(err, ErrEncryptedNoKey) {
+			// Encrypted row with no key — encryption was on, then disabled.
+			// Skip it, but count it so the caller can tell the difference
+			// from "no matches" instead of it looking like data loss.
+			skippedEncrypted++
+			continue
+		}
+		if err != nil {
+			// Corrupt row or (should not happen after the key check above)
+			// a decryption failure — skip rather than fail the whole search.
+			continue
 		}
 
-		// tags_nonce set means this row was written after tag encryption was
-		// added and tagsBytes is ciphertext; otherwise (including rows with
-		// content_encrypted=1 written before this change) tagsBytes is already
-		// plaintext JSON.
-		tagsJSON := tagsBytes
-		if len(tagsNonce) == gcmNonceSize {
-			tagsPlain, err := decryptContent(encryptionKey, tagsNonce, tagsBytes)
-			if err != nil {
-				// Should not happen after the key check above, but skip rather than crash.
-				continue
-			}
-			tagsJSON = []byte(tagsPlain)
-		}
-
-		var tags []string
-		if err := json.Unmarshal(tagsJSON, &tags); err != nil {
-			tags = []string{}
-		}
-
-		score := cosineSimilarity(queryEmbedding, emb)
 		results = append(results, SearchResult{
-			Record: Record{
-				ID:        id,
-				Content:   content,
-				Tags:      tags,
-				CreatedAt: time.Unix(createdAt, 0).UTC(),
-			},
-			Score: score,
+			Record: rec,
+			Score:  cosineSimilarity(queryEmbedding, emb),
 		})
 	}
 	if err := rows.Err(); err != nil {
@@ -292,6 +261,121 @@ func (s *Store) Search(ctx context.Context, userID string, queryEmbedding []floa
 		results = results[:limit]
 	}
 	return results, skippedEncrypted, nil
+}
+
+// Get returns the record with the given id if it belongs to userID. found is
+// false (with a nil error) when no such record exists for userID — as with
+// Remove, a record owned by someone else is indistinguishable from a missing
+// one, to prevent ID enumeration.
+//
+// When encryptionKey is non-nil it is validated first (see
+// verifyOrInitKeyCheck) and used to decrypt the record. An encrypted record
+// requested with a nil key returns ErrEncryptedNoKey rather than ciphertext.
+func (s *Store) Get(ctx context.Context, userID, id string, encryptionKey []byte) (rec Record, found bool, err error) {
+	if encryptionKey != nil {
+		if err := verifyOrInitKeyCheck(ctx, s.db, userID, encryptionKey); err != nil {
+			return Record{}, false, err
+		}
+	}
+
+	var r storedRow
+	err = s.db.QueryRowContext(ctx,
+		`SELECT id, content, tags, created_at, updated_at, content_nonce, content_encrypted, tags_nonce FROM records WHERE id = ? AND user_id = ?`,
+		id, userID,
+	).Scan(&r.id, &r.content, &r.tags, &r.createdAt, &r.updatedAt, &r.contentNonce, &r.contentEncrypted, &r.tagsNonce)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Record{}, false, nil
+	}
+	if err != nil {
+		return Record{}, false, fmt.Errorf("diary: get record: %w", err)
+	}
+
+	rec, err = r.decode(encryptionKey)
+	if err != nil {
+		return Record{}, false, err
+	}
+	return rec, true, nil
+}
+
+// Update overwrites the content, tags and embedding of the record with the
+// given id, but only if it belongs to userID (found is false otherwise, same
+// enumeration-safe contract as Remove). created_at is preserved; updated_at
+// is set to now. tags may be nil (stored as an empty JSON array) — callers
+// that want to keep the existing tags must pass them through explicitly.
+//
+// The record is re-written in whatever encryption mode encryptionKey implies
+// right now, regardless of how it was stored before: a non-nil key encrypts
+// content and tags with fresh nonces, a nil key stores plaintext. This mirrors
+// Add, so an edited record always ends up the same as a freshly added one.
+//
+// Update is a plain overwrite, not a read-modify-write: appending to a record
+// is done by the caller (mcpserver) as Get → concatenate → embed → Update.
+// Two concurrent appends to the same record could therefore lose one of
+// them. That's accepted for a single-caller personal diary — holding a
+// transaction open across the Gemini embedding round-trip would block every
+// other request on the store's single connection instead.
+func (s *Store) Update(ctx context.Context, userID, id, content string, tags []string, embedding []float32, encryptionKey []byte) (rec Record, found bool, err error) {
+	if tags == nil {
+		tags = []string{}
+	}
+	tagsJSON, err := json.Marshal(tags)
+	if err != nil {
+		return Record{}, false, fmt.Errorf("diary: marshal tags: %w", err)
+	}
+
+	// Defaults are the plaintext representation; overwritten below when encrypting.
+	var (
+		contentValue     any = content
+		tagsValue        any = string(tagsJSON)
+		contentNonce     []byte
+		tagsNonce        []byte
+		contentEncrypted = 0
+	)
+	if encryptionKey != nil {
+		if err := verifyOrInitKeyCheck(ctx, s.db, userID, encryptionKey); err != nil {
+			return Record{}, false, err
+		}
+		contentCiphertext, cn, err := encryptContent(encryptionKey, content)
+		if err != nil {
+			return Record{}, false, fmt.Errorf("diary: encrypt content: %w", err)
+		}
+		tagsCiphertext, tn, err := encryptContent(encryptionKey, string(tagsJSON))
+		if err != nil {
+			return Record{}, false, fmt.Errorf("diary: encrypt tags: %w", err)
+		}
+		contentValue, tagsValue = contentCiphertext, tagsCiphertext
+		contentNonce, tagsNonce = cn, tn
+		contentEncrypted = 1
+	}
+
+	// RETURNING created_at both detects "no such record for this user" (no
+	// row) and gives back the original creation time without a second query.
+	// now is truncated to whole seconds so the returned UpdatedAt matches what
+	// a later Get/Search reads back from the INTEGER column.
+	now := time.Now().UTC().Truncate(time.Second)
+	var createdAt int64
+	err = s.db.QueryRowContext(ctx,
+		`UPDATE records
+		    SET content = ?, tags = ?, embedding = ?, content_nonce = ?, content_encrypted = ?, tags_nonce = ?, updated_at = ?
+		  WHERE id = ? AND user_id = ?
+		RETURNING created_at`,
+		contentValue, tagsValue, encodeEmbedding(embedding), contentNonce, contentEncrypted, tagsNonce, now.Unix(),
+		id, userID,
+	).Scan(&createdAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Record{}, false, nil
+	}
+	if err != nil {
+		return Record{}, false, fmt.Errorf("diary: update record: %w", err)
+	}
+
+	return Record{
+		ID:        id,
+		Content:   content,
+		Tags:      tags,
+		CreatedAt: time.Unix(createdAt, 0).UTC(),
+		UpdatedAt: now,
+	}, true, nil
 }
 
 // Remove deletes the record with the given id only if it belongs to userID.
@@ -332,6 +416,77 @@ func (s *Store) Count(ctx context.Context, userID string) (int64, error) {
 // Close closes the underlying database connection.
 func (s *Store) Close() error {
 	return s.db.Close()
+}
+
+// storedRow is one records row as scanned from SQLite, before decryption —
+// shared by Search and Get so both decode encrypted/plaintext rows the same way.
+type storedRow struct {
+	id               string
+	content          []byte
+	tags             []byte
+	createdAt        int64
+	updatedAt        sql.NullInt64 // NULL until the record is first edited via Update
+	contentNonce     []byte        // nil for non-encrypted rows
+	contentEncrypted int
+	tagsNonce        []byte // nil for rows written before tag encryption existed
+}
+
+// decode turns r into a plaintext Record, decrypting with encryptionKey where
+// needed. Returns ErrEncryptedNoKey for an encrypted row when encryptionKey
+// is nil, and a plain error for a corrupt row or failed decryption.
+func (r storedRow) decode(encryptionKey []byte) (Record, error) {
+	var content string
+	if r.contentEncrypted == 1 {
+		if encryptionKey == nil {
+			return Record{}, ErrEncryptedNoKey
+		}
+		if len(r.contentNonce) != gcmNonceSize {
+			// content_nonce has no NOT NULL constraint, so a corrupt or
+			// out-of-band-written row can carry a nil or wrong-length nonce.
+			// gcm.Open panics (rather than erroring) on a wrong-length nonce,
+			// so this must be checked before calling decryptContent.
+			return Record{}, fmt.Errorf("diary: record %s has an invalid content nonce", r.id)
+		}
+		var err error
+		content, err = decryptContent(encryptionKey, r.contentNonce, r.content)
+		if err != nil {
+			return Record{}, err
+		}
+	} else {
+		content = string(r.content)
+	}
+
+	// tags_nonce set means this row was written after tag encryption was
+	// added and r.tags is ciphertext; otherwise (including rows with
+	// content_encrypted=1 written before this change) r.tags is already
+	// plaintext JSON.
+	tagsJSON := r.tags
+	if len(r.tagsNonce) == gcmNonceSize {
+		if encryptionKey == nil {
+			return Record{}, ErrEncryptedNoKey
+		}
+		tagsPlain, err := decryptContent(encryptionKey, r.tagsNonce, r.tags)
+		if err != nil {
+			return Record{}, err
+		}
+		tagsJSON = []byte(tagsPlain)
+	}
+
+	var tags []string
+	if err := json.Unmarshal(tagsJSON, &tags); err != nil {
+		tags = []string{}
+	}
+
+	rec := Record{
+		ID:        r.id,
+		Content:   content,
+		Tags:      tags,
+		CreatedAt: time.Unix(r.createdAt, 0).UTC(),
+	}
+	if r.updatedAt.Valid {
+		rec.UpdatedAt = time.Unix(r.updatedAt.Int64, 0).UTC()
+	}
+	return rec, nil
 }
 
 // encodeEmbedding packs a float32 slice into a little-endian byte slice for

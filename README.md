@@ -1,7 +1,7 @@
 # miranda-diary
 
-An MCP server that gives Miranda three tools for a personal diary:
-`diary_add_record`, `diary_search`, `diary_remove`. Notes and thoughts are
+An MCP server that gives Miranda four tools for a personal diary:
+`diary_add_record`, `diary_update_record`, `diary_search`, `diary_remove`. Notes and thoughts are
 stored in SQLite alongside semantic embeddings (Gemini `gemini-embedding-2`)
 so they can be retrieved by meaning, not just keywords. It's a standalone Go
 service — a sibling to [Miranda](../miranda) and
@@ -237,7 +237,7 @@ URL only works once Miranda's client trusts the diary's self-signed certificate.
 
 and set `DIARY_MCP_TOKEN` in Miranda's `.env` to the same value configured
 here. Miranda will then expose the tools as `diary_add_record`,
-`diary_search`, and `diary_remove`.
+`diary_update_record`, `diary_search`, and `diary_remove`.
 
 ## MCP tools
 
@@ -252,6 +252,26 @@ by meaning.
   "user_id": "alexander",
   "content": "Met with the team today to discuss the Q3 roadmap. Key decision: prioritise the billing rewrite.",
   "tags": ["work", "meeting", "q3"]
+}
+```
+
+### `diary_update_record`
+
+Edits an existing record in place — for keeping a running chronology in one
+entry instead of removing and re-adding it. `mode` is `"append"` (default:
+`content` is added to the end, separated by a blank line) or `"replace"`
+(`content` becomes the whole new text). `tags`, if given, replace the
+existing tags; omitted, they're kept. The full resulting text is re-embedded,
+`created_at` is preserved and `updated_at` is set. Like `diary_remove`, a
+record owned by another `user_id` looks the same as a missing one
+(`updated: false`).
+
+```json
+{
+  "user_id": "alexander",
+  "id": "550e8400-e29b-41d4-a716-446655440000",
+  "content": "14.11: plumber came, replaced the valve.",
+  "mode": "append"
 }
 ```
 
@@ -284,7 +304,7 @@ that the ID exists.
 
 ## User isolation
 
-All three tools take a `user_id` parameter. Miranda supplies it from
+All four tools take a `user_id` parameter. Miranda supplies it from
 conversation context (it knows who it's talking to). Isolation is enforced
 at the database level — every SQL query carries `WHERE user_id = ?` — so
 one user's records are never visible to another, even if they share the same
@@ -300,9 +320,9 @@ server operator.
 cmd/miranda-diary/        entrypoint: config, wiring, HTTP listen, graceful shutdown
 internal/config/          Default() + YAML config
 internal/envfile/         .env loader
-internal/diary/           SQLite store: Add, Search, Remove, Count + cosine similarity
+internal/diary/           SQLite store: Add, Get, Update, Search, Remove, Count + cosine similarity
 internal/embedding/       Embedder interface + Gemini implementation
-internal/mcpserver/       three MCP tools wired to store + embedder
+internal/mcpserver/       four MCP tools wired to store + embedder
 internal/httpserver/      bearer-token auth + /healthz
 scripts/deploy.sh         cross-compile + SSH deploy + systemd restart
 ```
